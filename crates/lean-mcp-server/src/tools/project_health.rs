@@ -241,6 +241,19 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Skip test if ripgrep is not installed (e.g. CI runners).
+    fn require_ripgrep() -> bool {
+        if std::process::Command::new("rg")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: ripgrep not installed");
+            return false;
+        }
+        true
+    }
+
     fn setup_project(files: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new().unwrap();
         for (name, content) in files {
@@ -255,6 +268,9 @@ mod tests {
 
     #[test]
     fn count_lean_files_finds_lean_files() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[
             ("Main.lean", "theorem foo : True := by trivial"),
             ("Lib.lean", "def x := 1"),
@@ -266,6 +282,9 @@ mod tests {
 
     #[test]
     fn count_lean_files_empty_project() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[("README.md", "no lean files")]);
         let count = count_lean_files(dir.path()).unwrap();
         assert_eq!(count, 0);
@@ -273,6 +292,9 @@ mod tests {
 
     #[test]
     fn find_sorries_detects_sorry() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[
             ("Main.lean", "theorem foo : True := by\n  sorry"),
             ("Lib.lean", "def x := 1"),
@@ -286,6 +308,9 @@ mod tests {
 
     #[test]
     fn find_sorries_skips_comments() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[(
             "Main.lean",
             "-- sorry this is a comment\ntheorem foo : True := by\n  sorry",
@@ -297,6 +322,9 @@ mod tests {
 
     #[test]
     fn find_sorries_no_matches() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[("Main.lean", "theorem foo : True := by trivial")]);
         let sorries = find_sorries(dir.path()).unwrap();
         assert!(sorries.is_empty());
@@ -304,6 +332,9 @@ mod tests {
 
     #[test]
     fn find_sorries_multiple_files() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[
             ("A.lean", "theorem a : True := sorry"),
             ("B.lean", "theorem b : True := sorry"),
@@ -314,6 +345,9 @@ mod tests {
 
     #[test]
     fn find_error_patterns_detects_check_failure() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[("Main.lean", "def x := 1\n#check_failure foo")]);
         let errors = find_error_patterns(dir.path()).unwrap();
         assert_eq!(errors.len(), 1);
@@ -323,6 +357,9 @@ mod tests {
 
     #[test]
     fn find_error_patterns_no_matches() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[("Main.lean", "def x := 1")]);
         let errors = find_error_patterns(dir.path()).unwrap();
         assert!(errors.is_empty());
@@ -330,6 +367,9 @@ mod tests {
 
     #[tokio::test]
     async fn handle_project_health_no_lsp() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[
             ("Main.lean", "theorem foo : True := by\n  sorry"),
             ("Lib.lean", "def x := 1"),
@@ -345,6 +385,9 @@ mod tests {
 
     #[tokio::test]
     async fn handle_project_health_empty_project() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[("README.md", "nothing")]);
         let result = handle_project_health(dir.path(), None, false)
             .await
@@ -356,6 +399,9 @@ mod tests {
 
     #[test]
     fn find_sorries_word_boundary() {
+        if !require_ripgrep() {
+            return;
+        }
         // "sorry" inside a string like "sorry_tactic" should NOT match
         // because we use \bsorry\b
         let dir = setup_project(&[("Main.lean", "def sorry_helper := 1\ndef x := sorry")]);
@@ -367,6 +413,9 @@ mod tests {
 
     #[test]
     fn find_sorries_in_subdirectories() {
+        if !require_ripgrep() {
+            return;
+        }
         let dir = setup_project(&[
             ("src/Main.lean", "theorem foo := sorry"),
             ("src/sub/Lib.lean", "theorem bar := sorry"),
