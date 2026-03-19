@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod batch_goals;
 pub mod build;
 pub mod code_actions;

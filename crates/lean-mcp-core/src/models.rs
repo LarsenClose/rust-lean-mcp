@@ -492,6 +492,42 @@ pub struct BatchGoalResult {
 }
 
 // ---------------------------------------------------------------------------
+// Generic batch
+// ---------------------------------------------------------------------------
+
+/// A single call in a generic batch request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchCall {
+    /// Tool name to invoke (e.g. "lean_goal").
+    pub tool_name: String,
+    /// Arguments object for that tool.
+    pub arguments: serde_json::Value,
+}
+
+/// Result of a single call inside a batch.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchCallResult {
+    /// Tool name that was invoked.
+    pub tool_name: String,
+    /// Result value on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// Whether this call failed.
+    pub is_error: bool,
+    /// Error message on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Result of a generic batch of tool calls.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchResult {
+    /// Results for each call, in the same order as input.
+    #[serde(default)]
+    pub items: Vec<BatchCallResult>,
+}
+
+// ---------------------------------------------------------------------------
 // Verification
 // ---------------------------------------------------------------------------
 
@@ -833,6 +869,9 @@ mod tests {
         assert_send_sync::<BatchGoalEntry>();
         assert_send_sync::<BatchGoalResult>();
         assert_send_sync::<GoalDiffResult>();
+        assert_send_sync::<BatchCall>();
+        assert_send_sync::<BatchCallResult>();
+        assert_send_sync::<BatchResult>();
     }
 
     // -- Widget types with serde_json::Value --
@@ -991,5 +1030,61 @@ mod tests {
         assert!(gdr.goals_removed.is_empty());
         assert!(gdr.hypotheses_added.is_empty());
         assert!(gdr.hypotheses_removed.is_empty());
+    }
+
+    // -- Generic batch types --
+
+    #[test]
+    fn round_trip_batch_call() {
+        let call = BatchCall {
+            tool_name: "lean_goal".into(),
+            arguments: json!({"file_path": "Main.lean", "line": 1}),
+        };
+        let json = serde_json::to_string(&call).unwrap();
+        let call2: BatchCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(call2.tool_name, "lean_goal");
+    }
+
+    #[test]
+    fn round_trip_batch_call_result_success() {
+        let r = BatchCallResult {
+            tool_name: "lean_goal".into(),
+            result: Some(json!({"line_context": "exact h"})),
+            is_error: false,
+            error: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let r2: BatchCallResult = serde_json::from_str(&json).unwrap();
+        assert!(!r2.is_error);
+        assert!(r2.result.is_some());
+        assert!(r2.error.is_none());
+    }
+
+    #[test]
+    fn round_trip_batch_call_result_error() {
+        let r = BatchCallResult {
+            tool_name: "lean_goal".into(),
+            result: None,
+            is_error: true,
+            error: Some("No LSP client".into()),
+        };
+        let v: Value = serde_json::to_value(&r).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("result"));
+    }
+
+    #[test]
+    fn round_trip_batch_result() {
+        let br = BatchResult {
+            items: vec![BatchCallResult {
+                tool_name: "lean_hover_info".into(),
+                result: Some(json!({"symbol": "Nat.add"})),
+                is_error: false,
+                error: None,
+            }],
+        };
+        let json = serde_json::to_string(&br).unwrap();
+        let br2: BatchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(br2.items.len(), 1);
+        assert_eq!(br2.items[0].tool_name, "lean_hover_info");
     }
 }
