@@ -5,3 +5,4 @@
 
 pub mod error;
 pub mod models;
+pub mod rate_limit;
