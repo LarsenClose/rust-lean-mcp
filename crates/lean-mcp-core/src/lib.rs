@@ -7,6 +7,7 @@ pub mod build_coordinator;
 pub mod config;
 pub mod error;
 pub mod file_utils;
+pub mod goal_diff;
 pub mod instructions;
 pub mod loogle;
 pub mod models;

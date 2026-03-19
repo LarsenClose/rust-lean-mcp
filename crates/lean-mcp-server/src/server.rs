@@ -250,6 +250,20 @@ pub struct BatchGoalParams {
     pub positions: Vec<lean_mcp_core::models::BatchGoalPosition>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct ProofDiffParams {
+    #[schemars(description = "Absolute or project-root-relative path to Lean file")]
+    pub file_path: String,
+    #[schemars(description = "Line before the tactic (1-indexed)")]
+    pub before_line: u32,
+    #[schemars(description = "Column on before_line (1-indexed, defaults to end of line)")]
+    pub before_column: Option<u32>,
+    #[schemars(description = "Line after the tactic (1-indexed)")]
+    pub after_line: u32,
+    #[schemars(description = "Column on after_line (1-indexed, defaults to end of line)")]
+    pub after_column: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // AppContext
 // ---------------------------------------------------------------------------
@@ -470,6 +484,30 @@ impl AppContext {
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
+    }
+
+    // ---- Proof Diff ----
+
+    #[tool(
+        name = "lean_proof_diff",
+        description = "Compare proof state before/after a tactic. Returns goals and hypotheses added/removed."
+    )]
+    async fn lean_proof_diff(
+        &self,
+        Parameters(params): Parameters<ProofDiffParams>,
+    ) -> Result<String, String> {
+        let client = self.ensure_client().await?;
+        tools::proof_diff::handle_lean_proof_diff(
+            client,
+            &params.file_path,
+            params.before_line,
+            params.before_column,
+            params.after_line,
+            params.after_column,
+        )
+        .await
+        .map(|r| Self::to_json(&r))
+        .map_err(|e| e.to_string())
     }
 
     // ---- Term Goal ----

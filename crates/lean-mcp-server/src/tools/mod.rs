@@ -9,6 +9,7 @@ pub mod hover;
 pub mod multi_attempt;
 pub mod outline;
 pub mod profile;
+pub mod proof_diff;
 pub mod references;
 pub mod run_code;
 pub mod search;

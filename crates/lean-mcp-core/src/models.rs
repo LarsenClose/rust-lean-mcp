@@ -516,6 +516,29 @@ pub struct VerifyResult {
 }
 
 // ---------------------------------------------------------------------------
+// Proof diff
+// ---------------------------------------------------------------------------
+
+/// Result of comparing proof state at two positions.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoalDiffResult {
+    /// Goal conclusions that appeared after but not before.
+    #[serde(default)]
+    pub goals_added: Vec<String>,
+    /// Goal conclusions that were before but not after.
+    #[serde(default)]
+    pub goals_removed: Vec<String>,
+    /// Hypotheses that appeared after but not before.
+    #[serde(default)]
+    pub hypotheses_added: Vec<String>,
+    /// Hypotheses that were before but not after.
+    #[serde(default)]
+    pub hypotheses_removed: Vec<String>,
+    /// Whether anything changed between the two states.
+    pub changed: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -809,6 +832,7 @@ mod tests {
         assert_send_sync::<BatchGoalPosition>();
         assert_send_sync::<BatchGoalEntry>();
         assert_send_sync::<BatchGoalResult>();
+        assert_send_sync::<GoalDiffResult>();
     }
 
     // -- Widget types with serde_json::Value --
@@ -937,5 +961,35 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let result2: BatchGoalResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result2.items.len(), 1);
+    }
+
+    // -- GoalDiffResult --
+
+    #[test]
+    fn round_trip_goal_diff_result() {
+        let gdr = GoalDiffResult {
+            goals_added: vec!["P".into()],
+            goals_removed: vec!["P -> P".into()],
+            hypotheses_added: vec!["h : P".into()],
+            hypotheses_removed: vec![],
+            changed: true,
+        };
+        let json = serde_json::to_string(&gdr).unwrap();
+        let gdr2: GoalDiffResult = serde_json::from_str(&json).unwrap();
+        assert!(gdr2.changed);
+        assert_eq!(gdr2.goals_added, vec!["P"]);
+        assert_eq!(gdr2.goals_removed, vec!["P -> P"]);
+        assert_eq!(gdr2.hypotheses_added, vec!["h : P"]);
+        assert!(gdr2.hypotheses_removed.is_empty());
+    }
+
+    #[test]
+    fn goal_diff_result_defaults_from_minimal_json() {
+        let gdr: GoalDiffResult = serde_json::from_str(r#"{"changed":false}"#).unwrap();
+        assert!(!gdr.changed);
+        assert!(gdr.goals_added.is_empty());
+        assert!(gdr.goals_removed.is_empty());
+        assert!(gdr.hypotheses_added.is_empty());
+        assert!(gdr.hypotheses_removed.is_empty());
     }
 }
