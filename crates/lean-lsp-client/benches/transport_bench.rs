@@ -1,5 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lean_lsp_client::jsonrpc::{Message, Notification, Request, Response, ResponseError};
+use lean_lsp_client::jsonrpc::{
+    Message, Notification, Request, RequestId, Response, ResponseError,
+};
 use lean_lsp_client::transport::{read_message, write_message};
 use serde_json::json;
 
@@ -31,7 +33,7 @@ fn bench_request_deserialize(c: &mut Criterion) {
 fn bench_response_serialize(c: &mut Criterion) {
     let resp = Response {
         jsonrpc: "2.0".to_string(),
-        id: Some(1),
+        id: Some(RequestId::Number(1)),
         result: Some(json!({
             "contents": {"kind": "markdown", "value": "```lean\nNat.add : Nat → Nat → Nat\n```"}
         })),
@@ -52,7 +54,7 @@ fn bench_response_deserialize(c: &mut Criterion) {
 fn bench_response_error_serialize(c: &mut Criterion) {
     let resp = Response {
         jsonrpc: "2.0".to_string(),
-        id: Some(1),
+        id: Some(RequestId::Number(1)),
         result: None,
         error: Some(ResponseError {
             code: -32601,

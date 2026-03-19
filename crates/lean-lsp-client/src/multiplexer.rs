@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
 use crate::error::TransportError;
-use crate::jsonrpc::{Message, Notification, Request};
+use crate::jsonrpc::{Message, Notification, Request, RequestId};
 use crate::transport::{read_message, write_message};
 
 /// Default timeout for requests (30 seconds).
@@ -57,7 +57,7 @@ pub struct Multiplexer {
     /// Channel to send outgoing messages to the writer task.
     outgoing_tx: mpsc::Sender<Value>,
     /// Pending requests awaiting responses, keyed by request ID.
-    pending: Arc<Mutex<HashMap<i64, PendingRequest>>>,
+    pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
     /// Next request ID.
     next_id: Arc<Mutex<i64>>,
     /// Notification handler.
@@ -79,7 +79,7 @@ impl Multiplexer {
         R: AsyncBufRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let pending: Arc<Mutex<HashMap<i64, PendingRequest>>> =
+        let pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let notification_handler: Arc<Mutex<Option<NotificationHandler>>> =
             Arc::new(Mutex::new(None));
@@ -143,12 +143,13 @@ impl Multiplexer {
         timeout: Duration,
     ) -> Result<Value, MultiplexerError> {
         // 1. Allocate next request ID.
-        let id = {
+        let numeric_id = {
             let mut next = self.next_id.lock().await;
             let id = *next;
             *next += 1;
             id
         };
+        let id = RequestId::Number(numeric_id);
 
         // 2. Create oneshot channel.
         let (tx, rx) = oneshot::channel();
@@ -156,15 +157,15 @@ impl Multiplexer {
         // 3. Register in pending map.
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(id, tx);
+            pending.insert(id.clone(), tx);
         }
 
         // 4. Build and send request via outgoing channel.
-        let request = Request::new(id, method, params);
+        let request = Request::new(numeric_id, method, params);
         let msg_value = serde_json::to_value(&request)
             .map_err(|e| MultiplexerError::Transport(TransportError::Json(e)))?;
 
-        debug!(id, method, "Sending request");
+        debug!(%id, method, "Sending request");
 
         self.outgoing_tx
             .send(msg_value)
@@ -219,7 +220,7 @@ impl Multiplexer {
         {
             let mut pending = self.pending.lock().await;
             for (id, sender) in pending.drain() {
-                debug!(id, "Cancelling pending request due to shutdown");
+                debug!(%id, "Cancelling pending request due to shutdown");
                 // Send a null value to indicate cancellation; the receiver
                 // will see this as a successful receive but with a sentinel.
                 // However, dropping the sender is cleaner since the receiver
@@ -246,7 +247,7 @@ impl Multiplexer {
     /// Background reader loop: reads messages and dispatches them.
     async fn reader_loop<R: AsyncBufRead + Unpin>(
         mut reader: R,
-        pending: Arc<Mutex<HashMap<i64, PendingRequest>>>,
+        pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
         notification_handler: Arc<Mutex<Option<NotificationHandler>>>,
     ) {
         loop {
@@ -279,7 +280,7 @@ impl Multiplexer {
     /// Dispatch a single parsed message to the correct handler.
     async fn dispatch_message(
         value: Value,
-        pending: &Arc<Mutex<HashMap<i64, PendingRequest>>>,
+        pending: &Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
         notification_handler: &Arc<Mutex<Option<NotificationHandler>>>,
     ) {
         match Message::from_value(value.clone()) {
@@ -290,9 +291,9 @@ impl Multiplexer {
                         // Send the full response value so the caller can
                         // inspect result/error.
                         let _ = sender.send(value);
-                        debug!(id, "Dispatched response to pending request");
+                        debug!(%id, "Dispatched response to pending request");
                     } else {
-                        warn!(id, "Received response for unknown request ID");
+                        warn!(%id, "Received response for unknown request ID");
                     }
                 }
             }
@@ -307,7 +308,7 @@ impl Multiplexer {
             Ok(Message::Request(req)) => {
                 // Server-to-client requests (e.g., window/showMessageRequest).
                 // We log but don't handle them for now.
-                debug!(id = req.id, method = %req.method, "Received server request (unhandled)");
+                debug!(id = %req.id, method = %req.method, "Received server request (unhandled)");
             }
             Err(e) => {
                 warn!(?e, "Failed to parse incoming message");
@@ -510,7 +511,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = mux.pending.lock().await;
-            pending.insert(999, tx);
+            pending.insert(RequestId::Number(999), tx);
         }
 
         // Shutdown should cancel the pending request by dropping all senders.
@@ -672,7 +673,7 @@ mod tests {
         let (_tx_unused, rx) = {
             let (tx, rx) = oneshot::channel::<Value>();
             let mut pending = mux.pending.lock().await;
-            pending.insert(999, tx);
+            pending.insert(RequestId::Number(999), tx);
             ((), rx)
         };
 
@@ -756,6 +757,76 @@ mod tests {
         assert_eq!(result["result"]["contents"], "Nat");
 
         server.await.unwrap();
+        mux.shutdown().await.unwrap();
+    }
+
+    // ── Test 16: Server request with string ID is handled ─────────
+
+    #[tokio::test]
+    async fn test_server_request_with_string_id_does_not_crash() {
+        let (mut server_writer, client_reader) = make_duplex(4096);
+        let (client_writer, server_reader) = make_duplex(4096);
+
+        let mux = Multiplexer::new(client_reader, client_writer);
+
+        // Server sends a request with a string ID (e.g., Lean's register_lean_watcher).
+        let server = tokio::spawn(async move {
+            let server_req = json!({
+                "jsonrpc": "2.0",
+                "id": "lean-watcher-1",
+                "method": "client/registerCapability",
+                "params": {"registrations": []}
+            });
+            write_message(&mut server_writer, &server_req)
+                .await
+                .unwrap();
+
+            // Then read and respond to a normal client request.
+            let mut reader = BufReader::new(server_reader);
+            let req = read_message(&mut reader).await.unwrap();
+            let id = req["id"].as_i64().unwrap();
+            let resp = json!({"jsonrpc": "2.0", "id": id, "result": "ok"});
+            write_message(&mut server_writer, &resp).await.unwrap();
+        });
+
+        // Give the reader time to process the string-ID request without crashing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Normal request should still work after receiving a string-ID server request.
+        let result = mux.request("test/method", None).await.unwrap();
+        assert_eq!(result["result"], "ok");
+
+        server.await.unwrap();
+        mux.shutdown().await.unwrap();
+    }
+
+    // ── Test 17: Response with string ID dispatched correctly ─────
+
+    #[tokio::test]
+    async fn test_response_with_string_id_dispatched() {
+        let (mut server_writer, client_reader) = make_duplex(4096);
+        let (client_writer, _server_reader) = make_duplex(4096);
+
+        let mux = Multiplexer::new(client_reader, client_writer);
+
+        // Manually register a pending request with a string ID.
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = mux.pending.lock().await;
+            pending.insert(RequestId::String("custom-id".to_string()), tx);
+        }
+
+        // Server sends a response with that string ID.
+        let resp = json!({"jsonrpc": "2.0", "id": "custom-id", "result": {"data": "found"}});
+        write_message(&mut server_writer, &resp).await.unwrap();
+
+        // The pending request should receive the response.
+        let result = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("should not timeout")
+            .expect("channel should not be dropped");
+        assert_eq!(result["result"]["data"], "found");
+
         mux.shutdown().await.unwrap();
     }
 }

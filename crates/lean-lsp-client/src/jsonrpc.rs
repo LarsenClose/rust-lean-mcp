@@ -2,6 +2,26 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
+
+/// A JSON-RPC 2.0 request ID, which can be a number or a string per the spec.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestId {
+    /// Numeric request ID.
+    Number(i64),
+    /// String request ID (e.g., Lean's `register_lean_watcher`).
+    String(String),
+}
+
+impl fmt::Display for RequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RequestId::Number(n) => write!(f, "{n}"),
+            RequestId::String(s) => write!(f, "\"{s}\""),
+        }
+    }
+}
 
 /// A JSON-RPC 2.0 request message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -9,7 +29,7 @@ pub struct Request {
     /// Protocol version, always "2.0".
     pub jsonrpc: String,
     /// Unique identifier for the request.
-    pub id: i64,
+    pub id: RequestId,
     /// The method to invoke.
     pub method: String,
     /// Optional parameters for the method.
@@ -23,7 +43,7 @@ pub struct Response {
     /// Protocol version, always "2.0".
     pub jsonrpc: String,
     /// The id of the request this response corresponds to.
-    pub id: Option<i64>,
+    pub id: Option<RequestId>,
     /// The result of a successful request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -57,11 +77,11 @@ pub struct Notification {
 }
 
 impl Request {
-    /// Create a new JSON-RPC request.
+    /// Create a new JSON-RPC request with a numeric ID.
     pub fn new(id: i64, method: &str, params: Option<Value>) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
-            id,
+            id: RequestId::Number(id),
             method: method.to_string(),
             params,
         }
@@ -124,7 +144,7 @@ mod tests {
     fn test_request_new() {
         let req = Request::new(1, "initialize", Some(json!({"rootUri": "file:///tmp"})));
         assert_eq!(req.jsonrpc, "2.0");
-        assert_eq!(req.id, 1);
+        assert_eq!(req.id, RequestId::Number(1));
         assert_eq!(req.method, "initialize");
         assert_eq!(req.params, Some(json!({"rootUri": "file:///tmp"})));
     }
@@ -133,7 +153,7 @@ mod tests {
     fn test_request_new_without_params() {
         let req = Request::new(42, "shutdown", None);
         assert_eq!(req.jsonrpc, "2.0");
-        assert_eq!(req.id, 42);
+        assert_eq!(req.id, RequestId::Number(42));
         assert_eq!(req.method, "shutdown");
         assert_eq!(req.params, None);
     }
@@ -164,9 +184,17 @@ mod tests {
         let json_str =
             r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"rootUri":"file:///tmp"}}"#;
         let req: Request = serde_json::from_str(json_str).unwrap();
-        assert_eq!(req.id, 3);
+        assert_eq!(req.id, RequestId::Number(3));
         assert_eq!(req.method, "initialize");
         assert_eq!(req.params, Some(json!({"rootUri": "file:///tmp"})));
+    }
+
+    #[test]
+    fn test_request_with_string_id_deserialization() {
+        let json_str = r#"{"jsonrpc":"2.0","id":"register-1","method":"client/registerCapability","params":{}}"#;
+        let req: Request = serde_json::from_str(json_str).unwrap();
+        assert_eq!(req.id, RequestId::String("register-1".to_string()));
+        assert_eq!(req.method, "client/registerCapability");
     }
 
     #[test]
@@ -181,7 +209,7 @@ mod tests {
     fn test_response_with_result() {
         let resp = Response {
             jsonrpc: "2.0".to_string(),
-            id: Some(1),
+            id: Some(RequestId::Number(1)),
             result: Some(json!({"capabilities": {}})),
             error: None,
         };
@@ -195,7 +223,7 @@ mod tests {
     fn test_response_with_error() {
         let resp = Response {
             jsonrpc: "2.0".to_string(),
-            id: Some(1),
+            id: Some(RequestId::Number(1)),
             result: None,
             error: Some(ResponseError {
                 code: -32601,
@@ -225,9 +253,16 @@ mod tests {
         let json_str =
             r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"hoverProvider":true}}}"#;
         let resp: Response = serde_json::from_str(json_str).unwrap();
-        assert_eq!(resp.id, Some(1));
+        assert_eq!(resp.id, Some(RequestId::Number(1)));
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_response_with_string_id_deserialization() {
+        let json_str = r#"{"jsonrpc":"2.0","id":"abc-123","result":null}"#;
+        let resp: Response = serde_json::from_str(json_str).unwrap();
+        assert_eq!(resp.id, Some(RequestId::String("abc-123".to_string())));
     }
 
     #[test]
@@ -262,8 +297,19 @@ mod tests {
         let msg = Message::from_value(value).unwrap();
         assert!(matches!(msg, Message::Request(_)));
         if let Message::Request(req) = msg {
-            assert_eq!(req.id, 1);
+            assert_eq!(req.id, RequestId::Number(1));
             assert_eq!(req.method, "initialize");
+        }
+    }
+
+    #[test]
+    fn test_message_from_value_request_with_string_id() {
+        let value = json!({"jsonrpc":"2.0","id":"lean-watcher-1","method":"client/registerCapability","params":{}});
+        let msg = Message::from_value(value).unwrap();
+        assert!(matches!(msg, Message::Request(_)));
+        if let Message::Request(req) = msg {
+            assert_eq!(req.id, RequestId::String("lean-watcher-1".to_string()));
+            assert_eq!(req.method, "client/registerCapability");
         }
     }
 
@@ -273,7 +319,7 @@ mod tests {
         let msg = Message::from_value(value).unwrap();
         assert!(matches!(msg, Message::Response(_)));
         if let Message::Response(resp) = msg {
-            assert_eq!(resp.id, Some(1));
+            assert_eq!(resp.id, Some(RequestId::Number(1)));
         }
     }
 
@@ -295,9 +341,32 @@ mod tests {
         let msg = Message::from_value(value).unwrap();
         assert!(matches!(msg, Message::Response(_)));
         if let Message::Response(resp) = msg {
-            assert_eq!(resp.id, Some(5));
+            assert_eq!(resp.id, Some(RequestId::Number(5)));
             assert!(resp.error.is_some());
             assert_eq!(resp.error.unwrap().code, -32601);
         }
+    }
+
+    #[test]
+    fn test_request_id_display() {
+        assert_eq!(format!("{}", RequestId::Number(42)), "42");
+        assert_eq!(
+            format!("{}", RequestId::String("abc".to_string())),
+            "\"abc\""
+        );
+    }
+
+    #[test]
+    fn test_request_id_hash_equality() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(RequestId::Number(1), "numeric");
+        map.insert(RequestId::String("abc".to_string()), "string");
+        assert_eq!(map.get(&RequestId::Number(1)), Some(&"numeric"));
+        assert_eq!(
+            map.get(&RequestId::String("abc".to_string())),
+            Some(&"string")
+        );
+        assert_eq!(map.get(&RequestId::Number(2)), None);
     }
 }
