@@ -2,3 +2,12 @@
 //!
 //! Contains domain models, rate limiting, build coordination, search utilities,
 //! file path resolution, and all logic independent of the MCP and LSP protocols.
+
+pub mod build_coordinator;
+pub mod config;
+pub mod error;
+pub mod file_utils;
+pub mod instructions;
+pub mod models;
+pub mod rate_limit;
+pub mod utils;

@@ -954,6 +954,7 @@ name = "lean-mcp-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "mockall",
  "pretty_assertions",
  "proptest",
@@ -976,10 +977,12 @@ name = "lean-mcp-server"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "clap",
  "lean-lsp-client",
  "lean-mcp-core",
  "predicates",
+ "regex",
  "rmcp",
  "serde",
  "serde_json",
