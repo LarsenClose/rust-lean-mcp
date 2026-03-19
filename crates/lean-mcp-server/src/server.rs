@@ -264,6 +264,12 @@ pub struct ProofDiffParams {
     pub after_column: Option<u32>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct BatchParams {
+    #[schemars(description = "Array of {tool_name, arguments} calls to execute concurrently")]
+    pub calls: Vec<lean_mcp_core::models::BatchCall>,
+}
+
 // ---------------------------------------------------------------------------
 // AppContext
 // ---------------------------------------------------------------------------
@@ -508,6 +514,24 @@ impl AppContext {
         .await
         .map(|r| Self::to_json(&r))
         .map_err(|e| e.to_string())
+    }
+
+    // ---- Generic Batch ----
+
+    #[tool(
+        name = "lean_batch",
+        description = "Execute multiple tool calls concurrently. Returns partial results on individual failures. Cannot call lean_batch recursively."
+    )]
+    async fn lean_batch(
+        &self,
+        Parameters(params): Parameters<BatchParams>,
+    ) -> Result<String, String> {
+        let client = self.ensure_client().await.ok();
+        let project_path = self.lean_project_path.as_deref();
+        let result =
+            tools::batch::handle_batch(params.calls, client, project_path, &self.search_config)
+                .await;
+        Ok(Self::to_json(&result))
     }
 
     // ---- Term Goal ----
