@@ -982,6 +982,7 @@ dependencies = [
  "lean-lsp-client",
  "lean-mcp-core",
  "predicates",
+ "regex",
  "rmcp",
  "serde",
  "serde_json",
