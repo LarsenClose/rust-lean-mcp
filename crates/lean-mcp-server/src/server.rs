@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::{Implementation, InitializeResult, ProtocolVersion, ServerCapabilities};
+use rmcp::model::{Implementation, InitializeResult, ServerCapabilities};
 
 use lean_mcp_core::instructions::INSTRUCTIONS;
 
@@ -66,18 +66,14 @@ pub fn server_instructions() -> &'static str {
 
 impl ServerHandler for AppContext {
     fn get_info(&self) -> InitializeResult {
-        InitializeResult {
-            protocol_version: ProtocolVersion::default(),
-            capabilities: ServerCapabilities::builder()
+        InitializeResult::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
                 .build(),
-            server_info: Implementation {
-                name: server_name().to_owned(),
-                version: server_version().to_owned(),
-            },
-            instructions: Some(server_instructions().to_owned()),
-        }
+        )
+        .with_server_info(Implementation::new(server_name(), server_version()))
+        .with_instructions(server_instructions())
     }
 }
 
