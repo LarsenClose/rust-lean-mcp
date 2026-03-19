@@ -455,6 +455,43 @@ pub struct CodeActionsResult {
 }
 
 // ---------------------------------------------------------------------------
+// Batch goals
+// ---------------------------------------------------------------------------
+
+/// A single position for a batch goal query.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchGoalPosition {
+    /// Relative path to the Lean file.
+    pub file_path: String,
+    /// Line number (1-indexed).
+    pub line: u32,
+    /// Column number (1-indexed). If omitted, returns goals before/after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+}
+
+/// Result for a single position in a batch goal query.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchGoalEntry {
+    /// The position that was queried.
+    pub position: BatchGoalPosition,
+    /// The goal state if the query succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<GoalState>,
+    /// Error message if the query failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Result of querying goals at multiple positions concurrently.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchGoalResult {
+    /// Results for each queried position (same order as input).
+    #[serde(default)]
+    pub items: Vec<BatchGoalEntry>,
+}
+
+// ---------------------------------------------------------------------------
 // Verification
 // ---------------------------------------------------------------------------
 
@@ -769,6 +806,9 @@ mod tests {
         assert_send_sync::<CodeActionsResult>();
         assert_send_sync::<SourceWarning>();
         assert_send_sync::<VerifyResult>();
+        assert_send_sync::<BatchGoalPosition>();
+        assert_send_sync::<BatchGoalEntry>();
+        assert_send_sync::<BatchGoalResult>();
     }
 
     // -- Widget types with serde_json::Value --
@@ -808,5 +848,94 @@ mod tests {
         assert_eq!(entry2.children.len(), 1);
         assert_eq!(entry2.children[0].name, "myTheorem");
         assert_eq!(entry2.children[0].type_signature, Some("Nat -> Nat".into()));
+    }
+
+    // -- BatchGoal types --
+
+    #[test]
+    fn round_trip_batch_goal_position() {
+        let pos = BatchGoalPosition {
+            file_path: "Main.lean".into(),
+            line: 5,
+            column: Some(3),
+        };
+        let json = serde_json::to_string(&pos).unwrap();
+        let pos2: BatchGoalPosition = serde_json::from_str(&json).unwrap();
+        assert_eq!(pos2.file_path, "Main.lean");
+        assert_eq!(pos2.line, 5);
+        assert_eq!(pos2.column, Some(3));
+    }
+
+    #[test]
+    fn batch_goal_position_omits_none_column() {
+        let pos = BatchGoalPosition {
+            file_path: "Main.lean".into(),
+            line: 1,
+            column: None,
+        };
+        let v: Value = serde_json::to_value(&pos).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("column"));
+    }
+
+    #[test]
+    fn round_trip_batch_goal_entry_success() {
+        let entry = BatchGoalEntry {
+            position: BatchGoalPosition {
+                file_path: "Main.lean".into(),
+                line: 2,
+                column: Some(3),
+            },
+            result: Some(GoalState {
+                line_context: "  exact h".into(),
+                goals: Some(vec!["⊢ True".into()]),
+                goals_before: None,
+                goals_after: None,
+            }),
+            error: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let entry2: BatchGoalEntry = serde_json::from_str(&json).unwrap();
+        assert!(entry2.result.is_some());
+        assert!(entry2.error.is_none());
+    }
+
+    #[test]
+    fn round_trip_batch_goal_entry_error() {
+        let entry = BatchGoalEntry {
+            position: BatchGoalPosition {
+                file_path: "Bad.lean".into(),
+                line: 99,
+                column: Some(1),
+            },
+            result: None,
+            error: Some("Line 99 out of range".into()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let entry2: BatchGoalEntry = serde_json::from_str(&json).unwrap();
+        assert!(entry2.result.is_none());
+        assert_eq!(entry2.error.as_deref(), Some("Line 99 out of range"));
+    }
+
+    #[test]
+    fn round_trip_batch_goal_result() {
+        let result = BatchGoalResult {
+            items: vec![BatchGoalEntry {
+                position: BatchGoalPosition {
+                    file_path: "Main.lean".into(),
+                    line: 1,
+                    column: Some(1),
+                },
+                result: Some(GoalState {
+                    line_context: "exact h".into(),
+                    goals: Some(vec![]),
+                    goals_before: None,
+                    goals_after: None,
+                }),
+                error: None,
+            }],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let result2: BatchGoalResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result2.items.len(), 1);
     }
 }
