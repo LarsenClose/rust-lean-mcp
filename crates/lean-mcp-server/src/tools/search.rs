@@ -1329,4 +1329,113 @@ mod tests {
         let json = json!([]);
         assert!(parse_premise_results(&json).is_empty());
     }
+
+    // =====================================================================
+    // Fixture-based parsing tests (real API response formats)
+    // =====================================================================
+
+    /// Path to the fixture directory (relative to workspace root).
+    const FIXTURES_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/api_responses"
+    );
+
+    #[test]
+    fn fixture_leansearch_parses_real_response() {
+        let fixture =
+            std::fs::read_to_string(format!("{FIXTURES_DIR}/leansearch_continuous.json")).unwrap();
+        let fixture_json: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+
+        let results = parse_leansearch_results(&fixture_json);
+        assert!(
+            !results.is_empty(),
+            "LeanSearch fixture should produce non-empty results"
+        );
+        assert_eq!(results.len(), 4, "Expected 4 results from fixture");
+
+        // Name arrays should be concatenated (no dots — join(""))
+        assert_eq!(results[0].name, "Continuous.comp");
+        assert_eq!(results[0].module_name, "MathlibTopologyContinuousOnBasic");
+        assert_eq!(results[0].kind, Some("theorem".to_string()));
+        // Type from array is also concatenated
+        assert!(results[0]
+            .r#type
+            .as_ref()
+            .is_some_and(|t| t.contains("Continuous")),);
+
+        // Scalar string type passes through unchanged
+        assert_eq!(results[2].name, "continuous_id");
+        assert_eq!(results[2].r#type, Some("Continuous id".to_string()));
+    }
+
+    #[test]
+    fn fixture_loogle_parses_real_response() {
+        let fixture =
+            std::fs::read_to_string(format!("{FIXTURES_DIR}/loogle_nat_add_comm.json")).unwrap();
+        let fixture_json: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+
+        let results = parse_loogle_results(&fixture_json, 10);
+        assert!(!results.is_empty());
+        assert_eq!(results.len(), 5);
+
+        assert_eq!(results[0].name, "Nat.add_comm");
+        assert!(results[0].r#type.contains("n + m = m + n"));
+        assert_eq!(results[0].module, "Init.Data.Nat.Lemmas");
+
+        // Test num_results truncation
+        let truncated = parse_loogle_results(&fixture_json, 2);
+        assert_eq!(truncated.len(), 2);
+    }
+
+    #[test]
+    fn fixture_leanfinder_parses_real_response() {
+        let fixture =
+            std::fs::read_to_string(format!("{FIXTURES_DIR}/leanfinder_commutativity.json"))
+                .unwrap();
+        let fixture_json: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+
+        let results = parse_leanfinder_results(&fixture_json);
+
+        // Should filter out the lean4 corpus entry
+        assert_eq!(results.len(), 3, "Expected 3 mathlib4 results");
+
+        // Name extracted from ?pattern= URL format
+        assert_eq!(results[0].full_name, "?pattern=mul_comm#doc",);
+        assert!(results[0].formal_statement.contains("a * b = b * a"));
+        assert!(results[0].informal_statement.contains("commutative"));
+    }
+
+    #[test]
+    fn fixture_ripgrep_jsonl_parses_match_lines() {
+        let fixture =
+            std::fs::read_to_string(format!("{FIXTURES_DIR}/ripgrep_declarations.jsonl")).unwrap();
+
+        let mut matches = Vec::new();
+        for line in fixture.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let json: serde_json::Value = serde_json::from_str(line).unwrap();
+            if json.get("type").and_then(|t| t.as_str()) == Some("match") {
+                let data = json.get("data").unwrap();
+                let file_path = data
+                    .get("path")
+                    .and_then(|p| p.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                let line_text = data
+                    .get("lines")
+                    .and_then(|l| l.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                matches.push((file_path.to_string(), line_text.to_string()));
+            }
+        }
+
+        assert_eq!(matches.len(), 4, "Expected 4 match lines in fixture");
+        assert!(matches[0].1.contains("theorem add_assoc"));
+        assert!(matches[1].1.contains("def myHelper"));
+        assert!(matches[2].1.contains("class MyGroup"));
+        assert!(matches[3].0.contains(".lake/packages/mathlib"));
+    }
 }
