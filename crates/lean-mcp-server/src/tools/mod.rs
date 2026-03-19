@@ -14,5 +14,6 @@ pub mod proof_diff;
 pub mod references;
 pub mod run_code;
 pub mod search;
+pub mod symbol_resolve;
 pub mod verify;
 pub mod widgets;
