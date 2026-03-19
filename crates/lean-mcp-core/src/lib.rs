@@ -10,4 +10,6 @@ pub mod file_utils;
 pub mod instructions;
 pub mod models;
 pub mod rate_limit;
+pub mod repl;
+pub mod search_utils;
 pub mod utils;
