@@ -68,6 +68,8 @@ pub struct GoalParams {
     pub line: u32,
     #[schemars(description = "Column (1-indexed). Omit for before/after")]
     pub column: Option<u32>,
+    #[schemars(description = "Declaration name to resolve line from (overrides line)")]
+    pub declaration_name: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -78,6 +80,8 @@ pub struct TermGoalParams {
     pub line: u32,
     #[schemars(description = "Column (1-indexed, defaults to end of line)")]
     pub column: Option<u32>,
+    #[schemars(description = "Declaration name to resolve line from (overrides line)")]
+    pub declaration_name: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -88,6 +92,8 @@ pub struct HoverParams {
     pub line: u32,
     #[schemars(description = "Column at START of identifier (1-indexed)")]
     pub column: u32,
+    #[schemars(description = "Declaration name to resolve line from (overrides line)")]
+    pub declaration_name: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -100,6 +106,8 @@ pub struct CompletionsParams {
     pub column: u32,
     #[schemars(description = "Max completions to return")]
     pub max_completions: Option<usize>,
+    #[schemars(description = "Declaration name to resolve line from (overrides line)")]
+    pub declaration_name: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -118,6 +126,8 @@ pub struct ReferencesParams {
     pub line: u32,
     #[schemars(description = "Column at START of identifier (1-indexed)")]
     pub column: u32,
+    #[schemars(description = "Declaration name to resolve line from (overrides line)")]
+    pub declaration_name: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -413,6 +423,26 @@ pub fn server_instructions() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Declaration-name resolution helper
+// ---------------------------------------------------------------------------
+
+/// Resolve `declaration_name` to its start line via document symbols, falling
+/// back to the provided `line` when no declaration name is given.
+async fn resolve_line(
+    client: &dyn LspClient,
+    file_path: &str,
+    line: u32,
+    declaration_name: Option<&str>,
+) -> Result<u32, String> {
+    match declaration_name {
+        Some(name) => tools::symbol_resolve::resolve_declaration_line(client, file_path, name)
+            .await
+            .map_err(|e| e.to_string()),
+        None => Ok(line),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tool routing (23 tools)
 // ---------------------------------------------------------------------------
 
@@ -514,7 +544,14 @@ impl AppContext {
         Parameters(params): Parameters<GoalParams>,
     ) -> Result<String, String> {
         let client = self.ensure_client().await?;
-        tools::goal::handle_lean_goal(client, &params.file_path, params.line, params.column)
+        let line = resolve_line(
+            client,
+            &params.file_path,
+            params.line,
+            params.declaration_name.as_deref(),
+        )
+        .await?;
+        tools::goal::handle_lean_goal(client, &params.file_path, line, params.column)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
@@ -573,7 +610,14 @@ impl AppContext {
         Parameters(params): Parameters<TermGoalParams>,
     ) -> Result<String, String> {
         let client = self.ensure_client().await?;
-        tools::goal::handle_lean_term_goal(client, &params.file_path, params.line, params.column)
+        let line = resolve_line(
+            client,
+            &params.file_path,
+            params.line,
+            params.declaration_name.as_deref(),
+        )
+        .await?;
+        tools::goal::handle_lean_term_goal(client, &params.file_path, line, params.column)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
@@ -590,7 +634,14 @@ impl AppContext {
         Parameters(params): Parameters<HoverParams>,
     ) -> Result<String, String> {
         let client = self.ensure_client().await?;
-        tools::hover::handle_lean_hover(client, &params.file_path, params.line, params.column)
+        let line = resolve_line(
+            client,
+            &params.file_path,
+            params.line,
+            params.declaration_name.as_deref(),
+        )
+        .await?;
+        tools::hover::handle_lean_hover(client, &params.file_path, line, params.column)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
@@ -607,10 +658,17 @@ impl AppContext {
         Parameters(params): Parameters<CompletionsParams>,
     ) -> Result<String, String> {
         let client = self.ensure_client().await?;
-        tools::completions::handle_lean_completions(
+        let line = resolve_line(
             client,
             &params.file_path,
             params.line,
+            params.declaration_name.as_deref(),
+        )
+        .await?;
+        tools::completions::handle_lean_completions(
+            client,
+            &params.file_path,
+            line,
             params.column,
             params.max_completions.unwrap_or(32),
         )
@@ -647,7 +705,14 @@ impl AppContext {
         Parameters(params): Parameters<ReferencesParams>,
     ) -> Result<String, String> {
         let client = self.ensure_client().await?;
-        tools::references::handle_references(client, &params.file_path, params.line, params.column)
+        let line = resolve_line(
+            client,
+            &params.file_path,
+            params.line,
+            params.declaration_name.as_deref(),
+        )
+        .await?;
+        tools::references::handle_references(client, &params.file_path, line, params.column)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())

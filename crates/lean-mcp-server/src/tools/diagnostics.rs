@@ -38,61 +38,7 @@ fn extract_failed_dependency_paths(message: &str) -> Vec<String> {
     paths
 }
 
-// ---------------------------------------------------------------------------
-// Declaration range via document symbols
-// ---------------------------------------------------------------------------
-
-/// Recursively search document symbols for `target_name` (case-sensitive).
-fn search_symbols<'a>(symbols: &'a [Value], target_name: &str) -> Option<&'a Value> {
-    for symbol in symbols {
-        if symbol.get("name").and_then(Value::as_str) == Some(target_name) {
-            return Some(symbol);
-        }
-        if let Some(children) = symbol.get("children").and_then(Value::as_array) {
-            if let Some(found) = search_symbols(children, target_name) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-/// Resolve a declaration name to its 1-indexed `(start_line, end_line)` range.
-async fn get_declaration_range(
-    client: &dyn LspClient,
-    file_path: &str,
-    declaration_name: &str,
-) -> Result<Option<(u32, u32)>, LeanToolError> {
-    let symbols =
-        client
-            .get_document_symbols(file_path)
-            .await
-            .map_err(|e| LeanToolError::LspError {
-                operation: "get_document_symbols".into(),
-                message: e.to_string(),
-            })?;
-
-    let Some(sym) = search_symbols(&symbols, declaration_name) else {
-        return Ok(None);
-    };
-
-    let Some(range) = sym.get("range") else {
-        return Ok(None);
-    };
-
-    let start_line = range
-        .pointer("/start/line")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32
-        + 1;
-    let end_line = range
-        .pointer("/end/line")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32
-        + 1;
-
-    Ok(Some((start_line, end_line)))
-}
+use super::symbol_resolve::get_declaration_range;
 
 // ---------------------------------------------------------------------------
 // Severity name mapping
@@ -585,39 +531,6 @@ mod tests {
         let result = process_diagnostics(&diags, true, None);
         assert_eq!(result.items[0].line, 11); // fullRange line 10 + 1
         assert_eq!(result.items[0].column, 4); // fullRange char 3 + 1
-    }
-
-    // ---- search_symbols ----
-
-    #[test]
-    fn search_symbols_finds_top_level() {
-        let symbols = vec![
-            json!({"name": "foo", "kind": 12}),
-            json!({"name": "bar", "kind": 6}),
-        ];
-        let found = search_symbols(&symbols, "bar");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap()["name"], "bar");
-    }
-
-    #[test]
-    fn search_symbols_finds_nested() {
-        let symbols = vec![json!({
-            "name": "Namespace",
-            "kind": 2,
-            "children": [
-                {"name": "innerThm", "kind": 12, "range": {"start": {"line": 5}, "end": {"line": 10}}}
-            ]
-        })];
-        let found = search_symbols(&symbols, "innerThm");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap()["name"], "innerThm");
-    }
-
-    #[test]
-    fn search_symbols_returns_none_when_missing() {
-        let symbols = vec![json!({"name": "foo", "kind": 12})];
-        assert!(search_symbols(&symbols, "missing").is_none());
     }
 
     // ---- handle_diagnostics (async integration with mock) ----
