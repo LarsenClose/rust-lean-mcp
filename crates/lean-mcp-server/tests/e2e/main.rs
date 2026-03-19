@@ -6,6 +6,7 @@
 mod helpers;
 
 mod errors;
+mod integration;
 mod protocol;
 mod shutdown;
 mod tools;

@@ -1,0 +1,8 @@
+{"type":"begin","data":{"path":{"text":"src/Basic.lean"}}}
+{"type":"match","data":{"path":{"text":"src/Basic.lean"},"lines":{"text":"theorem add_assoc (a b c : Nat) : a + (b + c) = (a + b) + c := by\n"},"line_number":5,"absolute_offset":120,"submatches":[{"match":{"text":"theorem add_assoc"},"start":0,"end":17}]}}
+{"type":"match","data":{"path":{"text":"src/Basic.lean"},"lines":{"text":"def myHelper (n : Nat) : Nat := n + 1\n"},"line_number":15,"absolute_offset":400,"submatches":[{"match":{"text":"def myHelper"},"start":0,"end":12}]}}
+{"type":"match","data":{"path":{"text":"src/Algebra.lean"},"lines":{"text":"class MyGroup (G : Type*) extends Mul G, One G where\n"},"line_number":3,"absolute_offset":50,"submatches":[{"match":{"text":"class MyGroup"},"start":0,"end":13}]}}
+{"type":"match","data":{"path":{"text":".lake/packages/mathlib/Mathlib/Data/Nat/Basic.lean"},"lines":{"text":"theorem Nat.add_comm_helper (a b c : Nat) : a + b = c → b + a = c := by\n"},"line_number":42,"absolute_offset":1800,"submatches":[{"match":{"text":"theorem Nat.add_comm_helper"},"start":0,"end":27}]}}
+{"type":"end","data":{"path":{"text":"src/Basic.lean"},"stats":{"elapsed":{"secs":0,"nanos":5000000},"searches":1,"searches_with_match":1,"bytes_searched":2048,"bytes_printed":512,"matched_lines":2,"matches":2}}}
+{"type":"end","data":{"path":{"text":"src/Algebra.lean"},"stats":{"elapsed":{"secs":0,"nanos":3000000},"searches":1,"searches_with_match":1,"bytes_searched":1024,"bytes_printed":256,"matched_lines":1,"matches":1}}}
+{"type":"summary","data":{"elapsed_total":{"secs":0,"nanos":10000000},"stats":{"elapsed":{"secs":0,"nanos":8000000},"searches":3,"searches_with_match":2,"bytes_searched":4096,"bytes_printed":1024,"matched_lines":4,"matches":4}}}
