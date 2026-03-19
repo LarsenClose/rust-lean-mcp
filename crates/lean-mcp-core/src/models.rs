@@ -575,6 +575,42 @@ pub struct GoalDiffResult {
 }
 
 // ---------------------------------------------------------------------------
+// Project health
+// ---------------------------------------------------------------------------
+
+/// A single sorry occurrence found in the project.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SorryLocation {
+    /// Relative file path within the project.
+    pub file: String,
+    /// Line number (1-indexed).
+    pub line: u32,
+    /// Source line text (trimmed).
+    pub text: String,
+    /// Enclosing declaration name, if detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decl: Option<String>,
+    /// Goal state at the sorry position (only when include_goals is true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+}
+
+/// Aggregated project health status.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectHealthResult {
+    /// Total number of `.lean` files in the project.
+    pub file_count: u32,
+    /// Sorry occurrences found.
+    #[serde(default)]
+    pub sorries: Vec<SorryLocation>,
+    /// Error-level diagnostic patterns found (e.g., `#check_failure`).
+    #[serde(default)]
+    pub errors: Vec<String>,
+    /// Whether the scan completed successfully.
+    pub success: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -872,6 +908,8 @@ mod tests {
         assert_send_sync::<BatchCall>();
         assert_send_sync::<BatchCallResult>();
         assert_send_sync::<BatchResult>();
+        assert_send_sync::<SorryLocation>();
+        assert_send_sync::<ProjectHealthResult>();
     }
 
     // -- Widget types with serde_json::Value --
@@ -1086,5 +1124,55 @@ mod tests {
         let br2: BatchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(br2.items.len(), 1);
         assert_eq!(br2.items[0].tool_name, "lean_hover_info");
+    }
+
+    // -- ProjectHealthResult --
+
+    #[test]
+    fn round_trip_project_health_result() {
+        let phr = ProjectHealthResult {
+            file_count: 37,
+            sorries: vec![SorryLocation {
+                file: "Mathlib/Tactic.lean".into(),
+                line: 42,
+                text: "  sorry".into(),
+                decl: Some("myTheorem".into()),
+                goal: Some("⊢ True".into()),
+            }],
+            errors: vec!["Mathlib/Bad.lean:10: unknown identifier 'foo'".into()],
+            success: true,
+        };
+        let json = serde_json::to_string(&phr).unwrap();
+        let phr2: ProjectHealthResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(phr2.file_count, 37);
+        assert_eq!(phr2.sorries.len(), 1);
+        assert_eq!(phr2.sorries[0].decl, Some("myTheorem".into()));
+        assert_eq!(phr2.sorries[0].goal, Some("⊢ True".into()));
+        assert_eq!(phr2.errors.len(), 1);
+        assert!(phr2.success);
+    }
+
+    #[test]
+    fn project_health_defaults_from_minimal_json() {
+        let phr: ProjectHealthResult =
+            serde_json::from_str(r#"{"file_count":0,"success":true}"#).unwrap();
+        assert_eq!(phr.file_count, 0);
+        assert!(phr.sorries.is_empty());
+        assert!(phr.errors.is_empty());
+        assert!(phr.success);
+    }
+
+    #[test]
+    fn sorry_location_omits_none_fields() {
+        let sl = SorryLocation {
+            file: "Main.lean".into(),
+            line: 5,
+            text: "sorry".into(),
+            decl: None,
+            goal: None,
+        };
+        let v: Value = serde_json::to_value(&sl).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("decl"));
+        assert!(!v.as_object().unwrap().contains_key("goal"));
     }
 }
