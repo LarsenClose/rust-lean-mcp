@@ -15,6 +15,8 @@ pub mod goal;
 #[allow(dead_code)]
 pub mod hover;
 #[allow(dead_code)]
+pub mod multi_attempt;
+#[allow(dead_code)]
 pub mod outline;
 #[allow(dead_code)]
 pub mod references;
