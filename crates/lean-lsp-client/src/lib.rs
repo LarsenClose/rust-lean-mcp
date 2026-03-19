@@ -2,3 +2,7 @@
 //!
 //! Provides a custom LSP client tailored to Lean's protocol extensions
 //! including proof goals, widgets, and interactive diagnostics.
+
+pub mod error;
+pub mod jsonrpc;
+pub mod transport;
