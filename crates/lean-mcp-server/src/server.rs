@@ -280,6 +280,12 @@ pub struct BatchParams {
     pub calls: Vec<lean_mcp_core::models::BatchCall>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct ProjectHealthParams {
+    #[schemars(description = "Fetch goal states at sorry positions (slow, requires LSP)")]
+    pub include_goals: Option<bool>,
+}
+
 // ---------------------------------------------------------------------------
 // AppContext
 // ---------------------------------------------------------------------------
@@ -461,6 +467,28 @@ impl AppContext {
         .await
         .map(|r| Self::to_json(&r))
         .map_err(|e| e.to_string())
+    }
+
+    // ---- Project Health ----
+
+    #[tool(
+        name = "lean_project_health",
+        description = "Scan project for sorry occurrences, error patterns, and file count. Fast ripgrep scan by default; set include_goals=true for slow LSP goal queries at sorry positions."
+    )]
+    async fn lean_project_health(
+        &self,
+        Parameters(params): Parameters<ProjectHealthParams>,
+    ) -> Result<String, String> {
+        let project_path = self.require_project_path()?;
+        let include_goals = params.include_goals.unwrap_or(false);
+        let client = if include_goals {
+            Some(self.ensure_client().await?)
+        } else {
+            None
+        };
+        tools::project_health::handle_project_health(project_path, client, include_goals)
+            .await
+            .map(|r| Self::to_json(&r))
     }
 
     // ---- File Outline ----

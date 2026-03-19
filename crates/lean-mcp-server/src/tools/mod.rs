@@ -10,6 +10,7 @@ pub mod hover;
 pub mod multi_attempt;
 pub mod outline;
 pub mod profile;
+pub mod project_health;
 pub mod proof_diff;
 pub mod references;
 pub mod run_code;
