@@ -17,7 +17,12 @@ tracing = "0.1"
 async-trait = "0.1"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tokio-test = "0.4"
 mockall = "0.14"
 tempfile = "3"
 pretty_assertions = "1"
+
+[[bench]]
+name = "transport_bench"
+harness = false
