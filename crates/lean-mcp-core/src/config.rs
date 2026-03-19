@@ -389,30 +389,31 @@ mod tests {
         }
     }
 
-    // Because env vars are process-global, tests that mutate them must run
-    // sequentially. We use unique env var names where possible, but for the
-    // real env vars we rely on `serial_test` not being available — instead
-    // we clean up after ourselves in each test.
+    // Env vars are process-global so tests that mutate them must be serialized.
+    use std::sync::Mutex;
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    /// Helper: temporarily set env vars, run a closure, then unset them.
+    /// Helper: temporarily set env vars under a global lock, clean up even on panic.
     fn with_env_vars<F, R>(vars: &[(&str, &str)], f: F) -> R
     where
-        F: FnOnce() -> R,
+        F: FnOnce() -> R + std::panic::UnwindSafe,
     {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         for (k, v) in vars {
-            std::env::set_var(k, v);
+            unsafe { std::env::set_var(k, v) };
         }
-        let result = f();
+        let result = std::panic::catch_unwind(f);
         for (k, _) in vars {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
-        result
+        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
     }
 
     // ---- Defaults ----
 
     #[test]
     fn config_defaults() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Ensure no relevant env vars leak in.
         let keys = [
             "LEAN_PROJECT_PATH",
@@ -428,7 +429,7 @@ mod tests {
             "LEAN_TRANSPORT",
         ];
         for k in &keys {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
 
         let cfg = Config::from_cli_and_env(&default_cli()).unwrap();
