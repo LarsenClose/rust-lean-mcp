@@ -52,27 +52,23 @@ async fn binary_smoke_local_search() {
     client.shutdown().await;
 }
 
-/// Spawn the binary with a temp project dir and verify lean_local_search runs
+/// Spawn the binary with a fixture project dir and verify lean_local_search runs
 /// against actual files on disk.
 #[tokio::test]
 async fn binary_local_search_with_project_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let lean_file = tmp.path().join("Test.lean");
-    std::fs::write(
-        &lean_file,
-        "import Lean\n\ntheorem my_test_theorem : True := trivial\n",
-    )
-    .unwrap();
+    let fixture_dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/lean_project"
+    );
 
-    let project_path = tmp.path().to_str().unwrap();
-    let mut client = McpTestClient::spawn_with_args(&["--lean-project-path", project_path]).await;
+    let mut client = McpTestClient::spawn_with_args(&["--lean-project-path", fixture_dir]).await;
     client.initialize().await;
 
     let response = client
         .call_tool(
             "lean_local_search",
             json!({
-                "query": "my_test_theorem",
+                "query": "test_theorem",
             }),
         )
         .await;
