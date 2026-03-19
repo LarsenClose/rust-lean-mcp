@@ -6,6 +6,7 @@
 pub mod client;
 pub mod error;
 pub mod jsonrpc;
+pub mod lean_client;
 pub mod multiplexer;
 pub mod transport;
 pub mod types;
