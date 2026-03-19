@@ -17,4 +17,6 @@ pub mod references;
 #[allow(dead_code)]
 pub mod run_code;
 #[allow(dead_code)]
+pub mod search;
+#[allow(dead_code)]
 pub mod widgets;
