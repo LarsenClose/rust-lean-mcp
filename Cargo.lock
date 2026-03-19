@@ -977,6 +977,7 @@ name = "lean-mcp-server"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "clap",
  "lean-lsp-client",
  "lean-mcp-core",

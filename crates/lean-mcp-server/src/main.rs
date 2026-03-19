@@ -2,6 +2,7 @@ use clap::Parser;
 use lean_mcp_core::config::CliArgs;
 
 mod server;
+mod tools;
 
 fn main() {
     // Parse CLI args (validates flags/env vars early).
