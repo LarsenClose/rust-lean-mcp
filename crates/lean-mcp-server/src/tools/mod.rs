@@ -1,6 +1,8 @@
 // Tool handlers are wired into MCP routing in a follow-up issue.
 // Suppress dead-code warnings until then.
 #[allow(dead_code)]
+pub mod batch_goals;
+#[allow(dead_code)]
 pub mod build;
 #[allow(dead_code)]
 pub mod code_actions;
