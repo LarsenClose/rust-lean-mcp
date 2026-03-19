@@ -1,0 +1,50 @@
+name: Story
+description: Propose a new feature or user story.
+title: "[Story]: "
+labels: [enhancement]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the feature or story you'd like to see implemented.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear summary of the feature or story.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: Define the conditions that must be met for this story to be considered complete.
+      placeholder: |
+        - [ ] Criterion 1
+        - [ ] Criterion 2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      description: Estimated effort for this story.
+      options:
+        - Small
+        - Medium
+        - Large
+        - Extra-Large
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Any additional information, references, or screenshots.
+    validations:
+      required: false
