@@ -4,9 +4,11 @@
 //! `ServerHandler` trait with all 23 tool handlers wired to the MCP protocol.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use lean_lsp_client::client::LspClient;
+use lean_lsp_client::lean_client::LeanLspClient;
 use lean_mcp_core::instructions::INSTRUCTIONS;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -15,6 +17,9 @@ use rmcp::schemars;
 use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router};
 use serde::Deserialize;
+use tokio::io::BufReader;
+use tokio::process::Command;
+use tokio::sync::OnceCell;
 
 use crate::tools;
 use tools::search::SearchConfig;
@@ -253,13 +258,13 @@ pub struct BatchGoalParams {
 ///
 /// Holds configuration and runtime handles that tools need: the LSP client
 /// for interacting with `lean --server`, search endpoint configuration, and
-/// the Lean project path.
+/// the Lean project path. The LSP client is lazily initialized on first use.
 #[derive(Clone)]
 pub struct AppContext {
     /// Path to the Lean project root, if configured.
     pub lean_project_path: Option<PathBuf>,
-    /// LSP client for communicating with the Lean server.
-    pub lsp_client: Option<Arc<dyn LspClient>>,
+    /// LSP client, lazily initialized by spawning `lake serve`.
+    lsp_client: Arc<OnceCell<Arc<dyn LspClient>>>,
     /// Search endpoint configuration (URLs for leansearch, loogle, etc.).
     pub search_config: SearchConfig,
     /// Tool router for rmcp tool dispatch.
@@ -270,7 +275,7 @@ impl std::fmt::Debug for AppContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppContext")
             .field("lean_project_path", &self.lean_project_path)
-            .field("lsp_client", &self.lsp_client.is_some())
+            .field("lsp_client", &self.lsp_client.initialized())
             .finish()
     }
 }
@@ -280,7 +285,7 @@ impl AppContext {
     pub fn new() -> Self {
         Self {
             lean_project_path: None,
-            lsp_client: None,
+            lsp_client: Arc::new(OnceCell::new()),
             search_config: SearchConfig::default(),
             tool_router: Self::tool_router(),
         }
@@ -290,17 +295,26 @@ impl AppContext {
     pub fn with_options(lean_project_path: Option<PathBuf>, search_config: SearchConfig) -> Self {
         Self {
             lean_project_path,
-            lsp_client: None,
+            lsp_client: Arc::new(OnceCell::new()),
             search_config,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Get the LSP client, returning an error string if not connected.
-    fn require_client(&self) -> Result<&dyn LspClient, String> {
-        self.lsp_client
-            .as_deref()
-            .ok_or_else(|| "LSP client not connected. Run lean_build first.".to_string())
+    /// Lazily connect to the Lean LSP server, spawning `lake serve` on first call.
+    async fn ensure_client(&self) -> Result<&dyn LspClient, String> {
+        let client = self
+            .lsp_client
+            .get_or_try_init(|| async {
+                let project_path = self
+                    .lean_project_path
+                    .as_ref()
+                    .ok_or_else(|| "No Lean project path configured.".to_string())?;
+
+                spawn_lsp_client(project_path.clone()).await
+            })
+            .await?;
+        Ok(client.as_ref())
     }
 
     /// Get the project path, returning an error string if not configured.
@@ -320,6 +334,37 @@ impl Default for AppContext {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Spawn `lake serve` and create a connected [`LeanLspClient`].
+async fn spawn_lsp_client(project_path: PathBuf) -> Result<Arc<dyn LspClient>, String> {
+    tracing::info!("Spawning `lake serve` in {}", project_path.display());
+
+    let mut child = Command::new("lake")
+        .arg("serve")
+        .current_dir(&project_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn `lake serve`: {e}"))?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to capture stdin of `lake serve`".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture stdout of `lake serve`".to_string())?;
+
+    let reader = BufReader::new(stdout);
+    let client = LeanLspClient::new(project_path, reader, stdin)
+        .await
+        .map_err(|e| format!("Failed to initialize LSP client: {e}"))?;
+
+    tracing::info!("LSP client connected");
+    Ok(Arc::new(client) as Arc<dyn LspClient>)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +423,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<FileOutlineParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::outline::handle_file_outline(client, &params.file_path, params.max_declarations)
             .await
             .map(|r| Self::to_json(&r))
@@ -395,7 +440,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<DiagnosticParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::diagnostics::handle_diagnostics(
             client,
             &params.file_path,
@@ -420,7 +465,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<GoalParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::goal::handle_lean_goal(client, &params.file_path, params.line, params.column)
             .await
             .map(|r| Self::to_json(&r))
@@ -437,7 +482,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<TermGoalParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::goal::handle_lean_term_goal(client, &params.file_path, params.line, params.column)
             .await
             .map(|r| Self::to_json(&r))
@@ -454,7 +499,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<HoverParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::hover::handle_lean_hover(client, &params.file_path, params.line, params.column)
             .await
             .map(|r| Self::to_json(&r))
@@ -471,7 +516,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<CompletionsParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::completions::handle_lean_completions(
             client,
             &params.file_path,
@@ -494,7 +539,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<DeclarationParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::declarations::handle_declaration_file(client, &params.file_path, &params.symbol)
             .await
             .map(|r| Self::to_json(&r))
@@ -511,7 +556,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<ReferencesParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::references::handle_references(client, &params.file_path, params.line, params.column)
             .await
             .map(|r| Self::to_json(&r))
@@ -528,7 +573,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<MultiAttemptParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::multi_attempt::handle_multi_attempt(
             client,
             None,
@@ -552,7 +597,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<RunCodeParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         let project_path = self.require_project_path()?;
         tools::run_code::handle_run_code(client, project_path, &params.code)
             .await
@@ -570,7 +615,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<VerifyParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::verify::handle_verify(
             client,
             &params.file_path,
@@ -678,7 +723,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<StateSearchParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::search::handle_state_search(
             client,
             &params.file_path,
@@ -702,7 +747,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<HammerPremiseParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::search::handle_hammer_premise(
             client,
             &params.file_path,
@@ -726,7 +771,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<CodeActionsParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::code_actions::handle_code_actions(client, &params.file_path, params.line)
             .await
             .map(|r| Self::to_json(&r))
@@ -743,7 +788,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<GetWidgetsParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::widgets::handle_get_widgets(client, &params.file_path, params.line, params.column)
             .await
             .map(|r| Self::to_json(&r))
@@ -758,7 +803,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<WidgetSourceParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::widgets::handle_get_widget_source(client, &params.file_path, &params.javascript_hash)
             .await
             .map(|r| Self::to_json(&r))
@@ -799,7 +844,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<BatchGoalParams>,
     ) -> Result<String, String> {
-        let client = self.require_client()?;
+        let client = self.ensure_client().await?;
         tools::batch_goals::handle_lean_goals_batch(client, params.positions)
             .await
             .map(|r| Self::to_json(&r))
@@ -849,7 +894,7 @@ mod tests {
     fn app_context_with_project_path() {
         let ctx = AppContext {
             lean_project_path: Some(PathBuf::from("/tmp/lean-project")),
-            lsp_client: None,
+            lsp_client: Arc::new(OnceCell::new()),
             search_config: SearchConfig::default(),
             tool_router: AppContext::tool_router(),
         };
@@ -906,10 +951,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn require_client_returns_error_when_none() {
+    #[tokio::test]
+    async fn ensure_client_returns_error_without_project_path() {
         let ctx = AppContext::new();
-        assert!(ctx.require_client().is_err());
+        assert!(ctx.ensure_client().await.is_err());
     }
 
     #[test]
@@ -922,7 +967,7 @@ mod tests {
     fn require_project_path_returns_ok_when_set() {
         let ctx = AppContext {
             lean_project_path: Some(PathBuf::from("/tmp/test")),
-            lsp_client: None,
+            lsp_client: Arc::new(OnceCell::new()),
             search_config: SearchConfig::default(),
             tool_router: AppContext::tool_router(),
         };

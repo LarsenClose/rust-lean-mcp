@@ -112,7 +112,7 @@ async fn lean_goal_returns_error_without_lsp_client() {
         "lean_goal without LSP should return isError=true"
     );
 
-    // The error content should mention the missing LSP client.
+    // The error content should mention the missing LSP client or project path.
     let content = result["content"]
         .as_array()
         .expect("content should be an array");
@@ -121,8 +121,9 @@ async fn lean_goal_returns_error_without_lsp_client() {
     assert!(
         text.to_lowercase().contains("lsp")
             || text.to_lowercase().contains("client")
+            || text.to_lowercase().contains("project path")
             || text.to_lowercase().contains("not configured"),
-        "error should mention LSP client: got {text}"
+        "error should mention LSP client or project path: got {text}"
     );
 
     client.shutdown().await;
