@@ -10,9 +10,6 @@ use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
 
-/// Default number of trailing output lines to include in the result.
-const DEFAULT_OUTPUT_LINES: usize = 20;
-
 /// Parse `[N/M]` progress patterns from build output.
 ///
 /// Returns a vec of `(completed, total)` pairs extracted from lines matching
@@ -159,6 +156,8 @@ pub async fn handle_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DEFAULT_OUTPUT_LINES: usize = 20;
 
     // ---- parse_progress ----
 
