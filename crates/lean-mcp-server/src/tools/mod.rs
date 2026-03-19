@@ -3,6 +3,8 @@
 #[allow(dead_code)]
 pub mod completions;
 #[allow(dead_code)]
+pub mod declarations;
+#[allow(dead_code)]
 pub mod diagnostics;
 #[allow(dead_code)]
 pub mod goal;
@@ -10,3 +12,7 @@ pub mod goal;
 pub mod hover;
 #[allow(dead_code)]
 pub mod references;
+#[allow(dead_code)]
+pub mod run_code;
+#[allow(dead_code)]
+pub mod widgets;
