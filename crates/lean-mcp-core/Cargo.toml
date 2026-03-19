@@ -21,9 +21,14 @@ uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tokio-test = "0.4"
 mockall = "0.14"
 wiremock = "0.6"
 tempfile = "3"
 proptest = "1"
 pretty_assertions = "1"
+
+[[bench]]
+name = "core_bench"
+harness = false
