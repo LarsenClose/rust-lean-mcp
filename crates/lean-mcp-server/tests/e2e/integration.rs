@@ -56,6 +56,16 @@ async fn binary_smoke_local_search() {
 /// against actual files on disk.
 #[tokio::test]
 async fn binary_local_search_with_project_path() {
+    // Skip if ripgrep not available (e.g. CI runners without it installed)
+    if std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: ripgrep not installed");
+        return;
+    }
+
     let fixture_dir = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/lean_project"
