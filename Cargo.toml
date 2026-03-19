@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/lean-lsp-client",
+    "crates/lean-mcp-core",
+    "crates/lean-mcp-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/LarsenClose/rust-lean-mcp"
+rust-version = "1.75"

@@ -1,0 +1,4 @@
+//! Async Lean 4 Language Server Protocol client.
+//!
+//! Provides a custom LSP client tailored to Lean's protocol extensions
+//! including proof goals, widgets, and interactive diagnostics.
