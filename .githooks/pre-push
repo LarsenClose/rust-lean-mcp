@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -e
+echo "Pre-push: running local checks..."
+cargo test --all --quiet 2>&1 | tail -5
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings 2>&1 | tail -1
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps 2>&1 | tail -1
+echo "All checks passed."
