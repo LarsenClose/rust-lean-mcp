@@ -64,9 +64,13 @@ pub async fn handle_run_code(
     project_path: &Path,
     code: &str,
 ) -> Result<RunResult, LeanToolError> {
-    // 1. Generate UUID-based temp filename.
-    let rel_path = format!("_mcp_snippet_{}.lean", Uuid::new_v4().as_simple());
-    let abs_path = project_path.join(&rel_path);
+    // 1. Generate UUID-based temp filename inside .lake/_mcp/ to avoid git pollution.
+    let mcp_dir = project_path.join(".lake").join("_mcp");
+    std::fs::create_dir_all(&mcp_dir)
+        .map_err(|e| LeanToolError::Other(format!("Error creating .lake/_mcp dir: {e}")))?;
+    let filename = format!("_mcp_snippet_{}.lean", Uuid::new_v4().as_simple());
+    let abs_path = mcp_dir.join(&filename);
+    let rel_path = format!(".lake/_mcp/{filename}");
 
     // 2. Write code to the temp file.
     std::fs::write(&abs_path, code)
@@ -360,13 +364,210 @@ mod tests {
             .await
             .unwrap();
 
-        // No _mcp_snippet_*.lean files should remain.
-        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+        // No _mcp_snippet_*.lean files should remain in .lake/_mcp/.
+        let mcp_dir = dir.path().join(".lake").join("_mcp");
+        if mcp_dir.exists() {
+            let remaining: Vec<_> = std::fs::read_dir(&mcp_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("_mcp_snippet_"))
+                .collect();
+            assert!(remaining.is_empty(), "temp file was not cleaned up");
+        }
+        // Also verify no temp files leaked to project root.
+        let root_remaining: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with("_mcp_snippet_"))
             .collect();
-        assert!(remaining.is_empty(), "temp file was not cleaned up");
+        assert!(
+            root_remaining.is_empty(),
+            "temp file should not be in project root"
+        );
+    }
+
+    // ---- temp files are created in .lake/_mcp/ ----
+
+    #[tokio::test]
+    async fn temp_files_in_lake_mcp_dir() {
+        let dir = TempDir::new().unwrap();
+
+        // Use a mock that tracks opened file paths.
+        struct PathTrackingClient {
+            project: PathBuf,
+            opened: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl LspClient for PathTrackingClient {
+            fn project_path(&self) -> &Path {
+                &self.project
+            }
+            async fn open_file(
+                &self,
+                p: &str,
+            ) -> Result<(), lean_lsp_client::client::LspClientError> {
+                self.opened.lock().unwrap().push(p.to_string());
+                Ok(())
+            }
+            async fn open_file_force(
+                &self,
+                _p: &str,
+            ) -> Result<(), lean_lsp_client::client::LspClientError> {
+                Ok(())
+            }
+            async fn get_file_content(
+                &self,
+                _p: &str,
+            ) -> Result<String, lean_lsp_client::client::LspClientError> {
+                Ok(String::new())
+            }
+            async fn update_file(
+                &self,
+                _p: &str,
+                _c: Vec<Value>,
+            ) -> Result<(), lean_lsp_client::client::LspClientError> {
+                Ok(())
+            }
+            async fn update_file_content(
+                &self,
+                _p: &str,
+                _c: &str,
+            ) -> Result<(), lean_lsp_client::client::LspClientError> {
+                Ok(())
+            }
+            async fn close_files(
+                &self,
+                _p: &[String],
+            ) -> Result<(), lean_lsp_client::client::LspClientError> {
+                Ok(())
+            }
+            async fn get_diagnostics(
+                &self,
+                _p: &str,
+                _sl: Option<u32>,
+                _el: Option<u32>,
+                _t: Option<f64>,
+            ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+                Ok(json!({"diagnostics": [], "success": true}))
+            }
+            async fn get_interactive_diagnostics(
+                &self,
+                _p: &str,
+                _sl: Option<u32>,
+                _el: Option<u32>,
+            ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(vec![])
+            }
+            async fn get_goal(
+                &self,
+                _p: &str,
+                _l: u32,
+                _c: u32,
+            ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(None)
+            }
+            async fn get_term_goal(
+                &self,
+                _p: &str,
+                _l: u32,
+                _c: u32,
+            ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(None)
+            }
+            async fn get_hover(
+                &self,
+                _p: &str,
+                _l: u32,
+                _c: u32,
+            ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(None)
+            }
+            async fn get_completions(
+                &self,
+                _p: &str,
+                _l: u32,
+                _c: u32,
+            ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(vec![])
+            }
+            async fn get_declarations(
+                &self,
+                _p: &str,
+                _l: u32,
+                _c: u32,
+            ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(vec![])
+            }
+            async fn get_references(
+                &self,
+                _p: &str,
+                _l: u32,
+                _c: u32,
+                _d: bool,
+            ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(vec![])
+            }
+            async fn get_document_symbols(
+                &self,
+                _p: &str,
+            ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(vec![])
+            }
+            async fn get_code_actions(
+                &self,
+                _p: &str,
+                _sl: u32,
+                _sc: u32,
+                _el: u32,
+                _ec: u32,
+            ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(vec![])
+            }
+            async fn get_code_action_resolve(
+                &self,
+                _a: Value,
+            ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+                Ok(json!({}))
+            }
+            async fn get_widgets(
+                &self,
+                _p: &str,
+                _l: u32,
+                _c: u32,
+            ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+                Ok(vec![])
+            }
+            async fn get_widget_source(
+                &self,
+                _p: &str,
+                _l: u32,
+                _c: u32,
+                _h: &str,
+            ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+                Ok(json!({}))
+            }
+            async fn shutdown(&self) -> Result<(), lean_lsp_client::client::LspClientError> {
+                Ok(())
+            }
+        }
+
+        let client = PathTrackingClient {
+            project: dir.path().to_path_buf(),
+            opened: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let _ = handle_run_code(&client, dir.path(), "#check Nat")
+            .await
+            .unwrap();
+
+        let opened = client.opened.lock().unwrap();
+        assert_eq!(opened.len(), 1);
+        assert!(
+            opened[0].starts_with(".lake/_mcp/_mcp_snippet_"),
+            "temp file should be in .lake/_mcp/, got: {}",
+            opened[0]
+        );
     }
 
     // ---- close_files is always called ----

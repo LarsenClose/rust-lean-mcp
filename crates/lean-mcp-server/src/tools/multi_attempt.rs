@@ -530,8 +530,11 @@ pub async fn run_snippet_isolated(
 
     let base_line_count = base_code.lines().count();
 
-    let rel_path = format!("_mcp_attempt_{}.lean", Uuid::new_v4().as_simple());
-    let abs_path = project_path.join(&rel_path);
+    let mcp_dir = project_path.join(".lake").join("_mcp");
+    std::fs::create_dir_all(&mcp_dir).ok(); // Ensure directory exists
+    let filename = format!("_mcp_attempt_{}.lean", Uuid::new_v4().as_simple());
+    let abs_path = mcp_dir.join(&filename);
+    let rel_path = format!(".lake/_mcp/{filename}");
 
     // Write temp file
     if let Err(e) = std::fs::write(&abs_path, &code) {
@@ -1650,12 +1653,26 @@ mod tests {
             .await
             .unwrap();
 
-        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+        // Check .lake/_mcp/ directory for leftover temp files.
+        let mcp_dir = dir.path().join(".lake").join("_mcp");
+        if mcp_dir.exists() {
+            let remaining: Vec<_> = std::fs::read_dir(&mcp_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("_mcp_attempt_"))
+                .collect();
+            assert!(remaining.is_empty(), "temp files were not cleaned up");
+        }
+        // Also verify no temp files in project root.
+        let root_remaining: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with("_mcp_attempt_"))
             .collect();
-        assert!(remaining.is_empty(), "temp files were not cleaned up");
+        assert!(
+            root_remaining.is_empty(),
+            "temp files should not be in project root"
+        );
     }
 
     // ---- Parallel: close_files called for each snippet ----
@@ -1681,8 +1698,51 @@ mod tests {
         );
         for path in closed.iter() {
             assert!(
-                path.starts_with("_mcp_attempt_"),
-                "closed path should be a temp file: {path}"
+                path.starts_with(".lake/_mcp/_mcp_attempt_"),
+                "closed path should be a temp file in .lake/_mcp/: {path}"
+            );
+        }
+    }
+
+    // ---- Parallel: temp files are in .lake/_mcp/ not project root ----
+
+    #[tokio::test]
+    async fn parallel_temp_files_in_lake_mcp_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        );
+
+        let snippets = vec!["simp".to_string()];
+        let _ = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets, None)
+            .await
+            .unwrap();
+
+        // The .lake/_mcp/ directory should have been created (even if files are cleaned up)
+        let mcp_dir = dir.path().join(".lake").join("_mcp");
+        assert!(
+            mcp_dir.exists(),
+            ".lake/_mcp/ directory should be created for temp files"
+        );
+
+        // Verify no temp files leaked to project root
+        let root_remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("_mcp_attempt_"))
+            .collect();
+        assert!(
+            root_remaining.is_empty(),
+            "temp files should not be in project root"
+        );
+
+        // Verify close_files paths have the new prefix
+        let closed = client.close_called.lock().unwrap();
+        for path in closed.iter() {
+            assert!(
+                path.starts_with(".lake/_mcp/"),
+                "closed path should be in .lake/_mcp/: {path}"
             );
         }
     }
@@ -1973,8 +2033,8 @@ mod tests {
             p: &str,
         ) -> Result<String, lean_lsp_client::client::LspClientError> {
             // Simulate cold LSP: if the file hasn't been opened, fail.
-            // Temp files (starting with _mcp_attempt_) are always "open".
-            if !p.starts_with("_mcp_attempt_") {
+            // Temp files (in .lake/_mcp/_mcp_attempt_) are always "open".
+            if !p.starts_with(".lake/_mcp/_mcp_attempt_") {
                 let calls = self.open_file_calls.lock().unwrap();
                 if !calls.contains(&p.to_string()) {
                     return Err(lean_lsp_client::client::LspClientError::FileNotOpen(
@@ -2166,7 +2226,7 @@ mod tests {
         }
         async fn open_file(&self, p: &str) -> Result<(), lean_lsp_client::client::LspClientError> {
             // Temp files succeed, source file fails
-            if !p.starts_with("_mcp_attempt_") {
+            if !p.starts_with(".lake/_mcp/_mcp_attempt_") {
                 return Err(lean_lsp_client::client::LspClientError::FileNotOpen(
                     format!("Cannot open file: {p}"),
                 ));
@@ -2653,16 +2713,19 @@ mod tests {
         .await
         .unwrap();
 
-        // Verify temp files were cleaned up
-        let remaining: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("_mcp_attempt_"))
-            .collect();
-        assert!(
-            remaining.is_empty(),
-            "temp files should be cleaned up even on timeout"
-        );
+        // Verify temp files were cleaned up from .lake/_mcp/
+        let mcp_dir = dir.path().join(".lake").join("_mcp");
+        if mcp_dir.exists() {
+            let remaining: Vec<_> = std::fs::read_dir(&mcp_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("_mcp_attempt_"))
+                .collect();
+            assert!(
+                remaining.is_empty(),
+                "temp files should be cleaned up even on timeout"
+            );
+        }
 
         // Verify close_files was called
         let closed = client.close_called.lock().unwrap();
