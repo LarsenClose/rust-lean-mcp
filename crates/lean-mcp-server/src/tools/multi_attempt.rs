@@ -378,7 +378,7 @@ async fn lsp_path(
 /// When `timeout_secs` is `Some(t)`, the entire LSP interaction (open, get
 /// diagnostics, get goal) is capped at `t` seconds. On timeout the result
 /// has `timed_out: true` with a warning diagnostic.
-async fn run_snippet_isolated(
+pub async fn run_snippet_isolated(
     client: &dyn LspClient,
     project_path: &Path,
     snippet: &str,
