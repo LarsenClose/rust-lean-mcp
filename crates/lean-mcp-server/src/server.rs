@@ -445,6 +445,20 @@ impl AppContext {
         Ok(client)
     }
 
+    /// Evict and shut down the LSP client for a project.
+    ///
+    /// Called after `lean_build` so the next tool call spawns a fresh
+    /// `lake serve` that loads the newly-built oleans.
+    async fn evict_client(&self, project_path: &Path) {
+        let old = {
+            let mut clients = self.clients.write().await;
+            clients.remove(project_path)
+        };
+        if let Some(client) = old {
+            let _ = client.shutdown().await;
+        }
+    }
+
     /// Convenience: resolve project from file_path, then get client.
     async fn client_for_file(&self, file_path: &str) -> Result<Arc<dyn LspClient>, String> {
         let project_path = self.resolve_project_path(Some(file_path))?;
@@ -556,14 +570,24 @@ impl AppContext {
         Parameters(params): Parameters<BuildParams>,
     ) -> Result<String, String> {
         let project_path = self.resolve_project_path(None)?;
-        tools::build::handle_build(
+
+        // Shut down the old LSP client before building so it doesn't hold
+        // file locks or stale state.
+        self.evict_client(&project_path).await;
+
+        let result = tools::build::handle_build(
             &project_path,
             params.clean.unwrap_or(false),
             params.output_lines.unwrap_or(20),
         )
         .await
-        .map(|r| Self::to_json(&r))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+        // The old client was evicted above. The next tool call will spawn a
+        // fresh `lake serve` that loads the newly-built oleans.
+        // (No need to eagerly respawn — ensure_client_for handles it lazily.)
+
+        Ok(Self::to_json(&result))
     }
 
     // ---- Project Health ----
