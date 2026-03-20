@@ -365,20 +365,33 @@ async fn lsp_path(
 
 /// Run a single snippet via an independent temp file, returning its result.
 ///
-/// The temp file contains `base_code + snippet + "\n  sorry"`, which gives the
-/// LSP enough context to check the tactic. Diagnostics are collected and
-/// the file is always cleaned up.
+/// The temp file contains `base_code + indented_snippet + indented_sorry`,
+/// which gives the LSP enough context to check the tactic. Diagnostics are
+/// collected and the file is always cleaned up.
+///
+/// `indent` is the leading whitespace from the target line, applied to each
+/// line of the snippet and to the trailing `sorry` so that Lean's
+/// whitespace-sensitive tactic blocks are preserved.
 async fn run_snippet_isolated(
     client: &dyn LspClient,
     project_path: &Path,
     snippet: &str,
     base_code: &str,
+    indent: &str,
 ) -> AttemptResult {
     let snippet_str = snippet.trim_end_matches('\n');
+
+    // Indent each line of the snippet to match the target line's indentation
+    let indented_snippet: String = snippet_str
+        .lines()
+        .map(|line| format!("{indent}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let code = if base_code.is_empty() {
-        format!("{snippet_str}\n  sorry")
+        format!("{indented_snippet}\n{indent}sorry")
     } else {
-        format!("{base_code}\n{snippet_str}\n  sorry")
+        format!("{base_code}\n{indented_snippet}\n{indent}sorry")
     };
 
     let base_line_count = base_code.lines().count();
@@ -440,7 +453,7 @@ async fn run_snippet_isolated(
         // The snippet's last line is at snippet_start_line + snippet_line_count - 1
         let goal_line = snippet_start_line + snippet_line_count - 1;
         let last_snippet_line = snippet_str.lines().last().unwrap_or("");
-        let goal_column = last_snippet_line.len() as u32;
+        let goal_column = indent.len() as u32 + last_snippet_line.len() as u32;
 
         let goal_result = client
             .get_goal(&rel_path, goal_line, goal_column)
@@ -518,10 +531,15 @@ pub async fn handle_multi_attempt_parallel(
     // 2. Extract code up to target line (imports + context before the tactic)
     let base_code = lines[..line as usize - 1].join("\n");
 
-    // 3. Fire all run_code calls concurrently
+    // 3. Extract target line's indentation so temp files preserve it
+    let target_line = lines[(line - 1) as usize];
+    let indent_len = target_line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+    let indent = &target_line[..indent_len];
+
+    // 4. Fire all run_code calls concurrently
     let futures: Vec<_> = snippets
         .iter()
-        .map(|snippet| run_snippet_isolated(client, project_path, snippet, &base_code))
+        .map(|snippet| run_snippet_isolated(client, project_path, snippet, &base_code, indent))
         .collect();
 
     let items = futures::future::join_all(futures).await;
@@ -1304,12 +1322,12 @@ mod tests {
     #[tokio::test]
     async fn parallel_single_snippet_returns_results() {
         let dir = tempfile::TempDir::new().unwrap();
-        // goal queried at (1, 4) -- line 1 (0-indexed), col = len("simp") = 4
+        // goal queried at (1, 6) -- line 1 (0-indexed), col = indent(2) + len("simp")(4) = 6
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(1, 4, Some(json!({"goals": ["|- True"]})));
+        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
@@ -1327,12 +1345,13 @@ mod tests {
     #[tokio::test]
     async fn parallel_multiple_snippets() {
         let dir = tempfile::TempDir::new().unwrap();
+        // goal columns: indent(2) + len("simp")(4) = 6, indent(2) + len("trivial")(7) = 9
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(1, 4, Some(json!({"goals": ["|- True"]})))
-        .with_goal(1, 7, Some(json!({"goals": []})));
+        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})))
+        .with_goal(1, 9, Some(json!({"goals": []})));
 
         let snippets = vec!["simp".to_string(), "trivial".to_string()];
         let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
@@ -1500,11 +1519,12 @@ mod tests {
     #[tokio::test]
     async fn handle_multi_attempt_dispatches_parallel() {
         let dir = tempfile::TempDir::new().unwrap();
+        // goal column: indent(2) + len("simp")(4) = 6
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(1, 4, Some(json!({"goals": ["|- True"]})));
+        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result =
@@ -1553,5 +1573,134 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.items[0].snippet, "simp");
+    }
+
+    // ========================================================================
+    // Parallel indentation tests (Closes #87)
+    // ========================================================================
+
+    // ---- Parallel: preserves indentation — goal queried at correct column ----
+
+    #[tokio::test]
+    async fn parallel_preserves_indentation_goal_column() {
+        // File has 2-space indented sorry at line 3.
+        // Prior tactic "intro h" at line 2.
+        // The snippet "simp" should be written as "  simp" in the temp file,
+        // so goal_column = indent(2) + len("simp")(4) = 6.
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  intro h\n  sorry",
+        )
+        // Goal at (2, 6): line 2 (0-indexed) = snippet line, col 6 = 2 indent + 4 "simp"
+        .with_goal(2, 6, Some(json!({"goals": ["h : True\n|- True"]})));
+
+        let snippets = vec!["simp".to_string()];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 3, &snippets)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].goals,
+            vec!["h : True\n|- True"],
+            "goal should be found at indented column (2 + 4 = 6)"
+        );
+    }
+
+    // ---- Parallel: indentation with empty base_code ----
+
+    #[tokio::test]
+    async fn parallel_indentation_empty_base_code() {
+        // Edge case: sorry is the FIRST line (line 1), so base_code is empty.
+        // 4-space indent on the sorry line.
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(dir.path().to_path_buf(), "    sorry")
+            // With empty base_code, snippet is at line 0 (0-indexed).
+            // goal_column = 4 (indent) + 4 ("simp") = 8
+            .with_goal(0, 8, Some(json!({"goals": ["|- Nat"]})));
+
+        let snippets = vec!["simp".to_string()];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 1, &snippets)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].goals,
+            vec!["|- Nat"],
+            "goal should be found at indented column even with empty base_code"
+        );
+    }
+
+    // ---- Parallel: multi-line snippet gets each line indented ----
+
+    #[tokio::test]
+    async fn parallel_multiline_snippet_indented() {
+        // A multi-line snippet "simp\nexact h" with 2-space indent should become:
+        //   "  simp\n  exact h" in the temp file.
+        // The goal is queried at the LAST line of the snippet.
+        // Last snippet line = "exact h" (len 7), indent = 2
+        // goal_column = 2 + 7 = 9
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        )
+        // snippet_start_line = 1 (base has 1 line: "theorem ...").
+        // Multi-line snippet has 2 lines, so last line is at 1 + 2 - 1 = line 2.
+        // goal_column = 2 + 7 = 9
+        .with_goal(2, 9, Some(json!({"goals": ["|- False"]})));
+
+        let snippets = vec!["simp\nexact h".to_string()];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].goals,
+            vec!["|- False"],
+            "multi-line snippet should have each line indented, goal at indent + last_line_len"
+        );
+    }
+
+    // ---- Parallel: sorry line uses target line indent (not hardcoded) ----
+
+    #[tokio::test]
+    async fn parallel_sorry_uses_target_indent() {
+        // With 4-space indent, the sorry line should be "    sorry" not "  sorry".
+        // We verify by checking diagnostics: the sorry line is at
+        // snippet_start_line + snippet_line_count (0-indexed).
+        // If we set a diagnostic at that line, it should be captured.
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n    sorry",
+        )
+        .with_diagnostics(vec![json!({
+            "range": {
+                "start": {"line": 2, "character": 0},
+                "end": {"line": 2, "character": 9}
+            },
+            "severity": 2,
+            "message": "declaration uses sorry"
+        })])
+        // goal at (1, 8): indent(4) + len("simp")(4) = 8
+        .with_goal(1, 8, Some(json!({"goals": ["|- True"]})));
+
+        let snippets = vec!["simp".to_string()];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap();
+
+        // The sorry line diagnostic at line 2 should be captured (it's within range)
+        assert_eq!(result.items[0].diagnostics.len(), 1);
+        assert_eq!(
+            result.items[0].diagnostics[0].message,
+            "declaration uses sorry"
+        );
+        // And the goal should be found at the correct indented position
+        assert_eq!(result.items[0].goals, vec!["|- True"]);
     }
 }
