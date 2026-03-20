@@ -3,9 +3,10 @@
 //! Defines [`AppContext`] for shared server state and implements the rmcp
 //! `ServerHandler` trait with all 23 tool handlers wired to the MCP protocol.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lean_lsp_client::client::LspClient;
 use lean_lsp_client::lean_client::LeanLspClient;
@@ -19,7 +20,6 @@ use rmcp::{tool, tool_handler, tool_router};
 use serde::Deserialize;
 use tokio::io::BufReader;
 use tokio::process::Command;
-use tokio::sync::OnceCell;
 
 use crate::tools;
 use tools::search::SearchConfig;
@@ -296,15 +296,18 @@ pub struct ProjectHealthParams {
 
 /// Shared application state for the MCP server.
 ///
-/// Holds configuration and runtime handles that tools need: the LSP client
+/// Holds configuration and runtime handles that tools need: LSP clients
 /// for interacting with `lean --server`, search endpoint configuration, and
-/// the Lean project path. The LSP client is lazily initialized on first use.
+/// the Lean project path. Supports per-project LSP clients and auto-detection
+/// of Lean project roots from file paths or CWD.
 #[derive(Clone)]
 pub struct AppContext {
-    /// Path to the Lean project root, if configured.
-    pub lean_project_path: Option<PathBuf>,
-    /// LSP client, lazily initialized by spawning `lake serve`.
-    lsp_client: Arc<OnceCell<Arc<dyn LspClient>>>,
+    /// Explicit project path from CLI/env (takes precedence over detection).
+    explicit_project_path: Option<PathBuf>,
+    /// Per-project LSP clients, keyed by canonicalized project root.
+    clients: Arc<tokio::sync::RwLock<HashMap<PathBuf, Arc<dyn LspClient>>>>,
+    /// Cached CWD-based project detection result.
+    cwd_project: Arc<OnceLock<Option<PathBuf>>>,
     /// Search endpoint configuration (URLs for leansearch, loogle, etc.).
     pub search_config: SearchConfig,
     /// Tool router for rmcp tool dispatch.
@@ -314,8 +317,11 @@ pub struct AppContext {
 impl std::fmt::Debug for AppContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppContext")
-            .field("lean_project_path", &self.lean_project_path)
-            .field("lsp_client", &self.lsp_client.initialized())
+            .field("explicit_project_path", &self.explicit_project_path)
+            .field(
+                "client_count",
+                &self.clients.try_read().map(|c| c.len()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -324,8 +330,9 @@ impl AppContext {
     /// Create an [`AppContext`] with no Lean project path or LSP client.
     pub fn new() -> Self {
         Self {
-            lean_project_path: None,
-            lsp_client: Arc::new(OnceCell::new()),
+            explicit_project_path: None,
+            clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            cwd_project: Arc::new(OnceLock::new()),
             search_config: SearchConfig::default(),
             tool_router: Self::tool_router(),
         }
@@ -334,34 +341,82 @@ impl AppContext {
     /// Create an [`AppContext`] with the given project path and search config.
     pub fn with_options(lean_project_path: Option<PathBuf>, search_config: SearchConfig) -> Self {
         Self {
-            lean_project_path,
-            lsp_client: Arc::new(OnceCell::new()),
+            explicit_project_path: lean_project_path,
+            clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            cwd_project: Arc::new(OnceLock::new()),
             search_config,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Lazily connect to the Lean LSP server, spawning `lake serve` on first call.
-    async fn ensure_client(&self) -> Result<&dyn LspClient, String> {
-        let client = self
-            .lsp_client
-            .get_or_try_init(|| async {
-                let project_path = self
-                    .lean_project_path
-                    .as_ref()
-                    .ok_or_else(|| "No Lean project path configured.".to_string())?;
-
-                spawn_lsp_client(project_path.clone()).await
-            })
-            .await?;
-        Ok(client.as_ref())
+    /// Resolve the Lean project path using the fallback chain:
+    /// 1. Explicit CLI path (always wins)
+    /// 2. Auto-detect from file_path (walk up looking for project markers)
+    /// 3. Auto-detect from CWD (cached)
+    /// 4. Error
+    fn resolve_project_path(&self, file_path: Option<&str>) -> Result<PathBuf, String> {
+        // 1. Explicit path
+        if let Some(ref pp) = self.explicit_project_path {
+            return Ok(pp.clone());
+        }
+        // 2. Detect from file_path
+        if let Some(fp) = file_path {
+            let path = Path::new(fp);
+            let abs_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+            if let Some(project) = lean_mcp_core::file_utils::detect_lean_project(&abs_path) {
+                return Ok(project);
+            }
+        }
+        // 3. Detect from CWD (cached)
+        let cwd_result = self.cwd_project.get_or_init(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| lean_mcp_core::file_utils::detect_lean_project(&cwd))
+        });
+        if let Some(ref project) = cwd_result {
+            return Ok(project.clone());
+        }
+        // 4. Error
+        Err(
+            "No Lean project path configured and auto-detection failed. \
+             Pass --lean-project-path or run from within a Lean project directory."
+                .to_string(),
+        )
     }
 
-    /// Get the project path, returning an error string if not configured.
-    fn require_project_path(&self) -> Result<&Path, String> {
-        self.lean_project_path
-            .as_deref()
-            .ok_or_else(|| "No Lean project path configured.".to_string())
+    /// Get or create an LSP client for a specific project.
+    async fn ensure_client_for(&self, project_path: &Path) -> Result<Arc<dyn LspClient>, String> {
+        // Fast path: read lock
+        {
+            let clients = self.clients.read().await;
+            if let Some(client) = clients.get(project_path) {
+                return Ok(client.clone());
+            }
+        }
+        // Slow path: write lock with double-check
+        let mut clients = self.clients.write().await;
+        if let Some(client) = clients.get(project_path) {
+            return Ok(client.clone());
+        }
+        let client = spawn_lsp_client(project_path.to_path_buf()).await?;
+        clients.insert(project_path.to_path_buf(), client.clone());
+        Ok(client)
+    }
+
+    /// Convenience: resolve project from file_path, then get client.
+    async fn client_for_file(&self, file_path: &str) -> Result<Arc<dyn LspClient>, String> {
+        let project_path = self.resolve_project_path(Some(file_path))?;
+        self.ensure_client_for(&project_path).await
+    }
+
+    /// Convenience: resolve default project, then get client (for tools without file_path).
+    async fn client_default(&self) -> Result<Arc<dyn LspClient>, String> {
+        let project_path = self.resolve_project_path(None)?;
+        self.ensure_client_for(&project_path).await
     }
 
     /// Serialize a result to JSON, falling back to the Debug representation.
@@ -462,9 +517,9 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<BuildParams>,
     ) -> Result<String, String> {
-        let project_path = self.require_project_path()?;
+        let project_path = self.resolve_project_path(None)?;
         tools::build::handle_build(
-            project_path,
+            &project_path,
             params.clean.unwrap_or(false),
             params.output_lines.unwrap_or(20),
         )
@@ -483,16 +538,20 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<ProjectHealthParams>,
     ) -> Result<String, String> {
-        let project_path = self.require_project_path()?;
+        let project_path = self.resolve_project_path(None)?;
         let include_goals = params.include_goals.unwrap_or(false);
         let client = if include_goals {
-            Some(self.ensure_client().await?)
+            Some(self.ensure_client_for(&project_path).await?)
         } else {
             None
         };
-        tools::project_health::handle_project_health(project_path, client, include_goals)
-            .await
-            .map(|r| Self::to_json(&r))
+        tools::project_health::handle_project_health(
+            &project_path,
+            client.as_ref().map(|c| c.as_ref()),
+            include_goals,
+        )
+        .await
+        .map(|r| Self::to_json(&r))
     }
 
     // ---- File Outline ----
@@ -505,11 +564,15 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<FileOutlineParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
-        tools::outline::handle_file_outline(client, &params.file_path, params.max_declarations)
-            .await
-            .map(|r| Self::to_json(&r))
-            .map_err(|e| e.to_string())
+        let client = self.client_for_file(&params.file_path).await?;
+        tools::outline::handle_file_outline(
+            client.as_ref(),
+            &params.file_path,
+            params.max_declarations,
+        )
+        .await
+        .map(|r| Self::to_json(&r))
+        .map_err(|e| e.to_string())
     }
 
     // ---- Diagnostics ----
@@ -522,9 +585,9 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<DiagnosticParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         tools::diagnostics::handle_diagnostics(
-            client,
+            client.as_ref(),
             &params.file_path,
             params.start_line,
             params.end_line,
@@ -547,15 +610,15 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<GoalParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
-            client,
+            client.as_ref(),
             &params.file_path,
             params.line,
             params.declaration_name.as_deref(),
         )
         .await?;
-        tools::goal::handle_lean_goal(client, &params.file_path, line, params.column)
+        tools::goal::handle_lean_goal(client.as_ref(), &params.file_path, line, params.column)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
@@ -571,9 +634,9 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<ProofDiffParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         tools::proof_diff::handle_lean_proof_diff(
-            client,
+            client.as_ref(),
             &params.file_path,
             params.before_line,
             params.before_column,
@@ -595,11 +658,18 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<BatchParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await.ok();
-        let project_path = self.lean_project_path.as_deref();
-        let result =
-            tools::batch::handle_batch(params.calls, client, project_path, &self.search_config)
-                .await;
+        let project_path = self.resolve_project_path(None).ok();
+        let client = match &project_path {
+            Some(pp) => self.ensure_client_for(pp).await.ok(),
+            None => None,
+        };
+        let result = tools::batch::handle_batch(
+            params.calls,
+            client.as_ref().map(|c| c.as_ref()),
+            project_path.as_deref(),
+            &self.search_config,
+        )
+        .await;
         Ok(Self::to_json(&result))
     }
 
@@ -613,15 +683,15 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<TermGoalParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
-            client,
+            client.as_ref(),
             &params.file_path,
             params.line,
             params.declaration_name.as_deref(),
         )
         .await?;
-        tools::goal::handle_lean_term_goal(client, &params.file_path, line, params.column)
+        tools::goal::handle_lean_term_goal(client.as_ref(), &params.file_path, line, params.column)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
@@ -637,15 +707,15 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<HoverParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
-            client,
+            client.as_ref(),
             &params.file_path,
             params.line,
             params.declaration_name.as_deref(),
         )
         .await?;
-        tools::hover::handle_lean_hover(client, &params.file_path, line, params.column)
+        tools::hover::handle_lean_hover(client.as_ref(), &params.file_path, line, params.column)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
@@ -661,16 +731,16 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<CompletionsParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
-            client,
+            client.as_ref(),
             &params.file_path,
             params.line,
             params.declaration_name.as_deref(),
         )
         .await?;
         tools::completions::handle_lean_completions(
-            client,
+            client.as_ref(),
             &params.file_path,
             line,
             params.column,
@@ -691,11 +761,15 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<DeclarationParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
-        tools::declarations::handle_declaration_file(client, &params.file_path, &params.symbol)
-            .await
-            .map(|r| Self::to_json(&r))
-            .map_err(|e| e.to_string())
+        let client = self.client_for_file(&params.file_path).await?;
+        tools::declarations::handle_declaration_file(
+            client.as_ref(),
+            &params.file_path,
+            &params.symbol,
+        )
+        .await
+        .map(|r| Self::to_json(&r))
+        .map_err(|e| e.to_string())
     }
 
     // ---- References ----
@@ -708,18 +782,23 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<ReferencesParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
-            client,
+            client.as_ref(),
             &params.file_path,
             params.line,
             params.declaration_name.as_deref(),
         )
         .await?;
-        tools::references::handle_references(client, &params.file_path, line, params.column)
-            .await
-            .map(|r| Self::to_json(&r))
-            .map_err(|e| e.to_string())
+        tools::references::handle_references(
+            client.as_ref(),
+            &params.file_path,
+            line,
+            params.column,
+        )
+        .await
+        .map(|r| Self::to_json(&r))
+        .map_err(|e| e.to_string())
     }
 
     // ---- Multi-Attempt ----
@@ -732,9 +811,9 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<MultiAttemptParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         tools::multi_attempt::handle_multi_attempt(
-            client,
+            client.as_ref(),
             None,
             &params.file_path,
             params.line,
@@ -757,9 +836,9 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<RunCodeParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
-        let project_path = self.require_project_path()?;
-        tools::run_code::handle_run_code(client, project_path, &params.code)
+        let project_path = self.resolve_project_path(None)?;
+        let client = self.ensure_client_for(&project_path).await?;
+        tools::run_code::handle_run_code(client.as_ref(), &project_path, &params.code)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
@@ -775,9 +854,9 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<VerifyParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         tools::verify::handle_verify(
-            client,
+            client.as_ref(),
             &params.file_path,
             &params.theorem_name,
             params.scan_source.unwrap_or(true),
@@ -797,17 +876,14 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<LocalSearchParams>,
     ) -> Result<String, String> {
-        let root = params
-            .project_root
-            .map(PathBuf::from)
-            .or_else(|| self.lean_project_path.clone());
-        let root = root
-            .as_deref()
-            .ok_or_else(|| "No project path available for local search.".to_string())?;
+        let root = match params.project_root {
+            Some(r) => PathBuf::from(r),
+            None => self.resolve_project_path(None)?,
+        };
         lean_mcp_core::search_utils::lean_local_search(
             &params.query,
             params.limit.unwrap_or(10),
-            root,
+            &root,
         )
         .map(|r| Self::to_json(&r))
         .map_err(|e| e.to_string())
@@ -883,9 +959,9 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<StateSearchParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         tools::search::handle_state_search(
-            client,
+            client.as_ref(),
             &params.file_path,
             params.line,
             params.column,
@@ -907,9 +983,9 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<HammerPremiseParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
+        let client = self.client_for_file(&params.file_path).await?;
         tools::search::handle_hammer_premise(
-            client,
+            client.as_ref(),
             &params.file_path,
             params.line,
             params.column,
@@ -931,8 +1007,8 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<CodeActionsParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
-        tools::code_actions::handle_code_actions(client, &params.file_path, params.line)
+        let client = self.client_for_file(&params.file_path).await?;
+        tools::code_actions::handle_code_actions(client.as_ref(), &params.file_path, params.line)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
@@ -948,11 +1024,16 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<GetWidgetsParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
-        tools::widgets::handle_get_widgets(client, &params.file_path, params.line, params.column)
-            .await
-            .map(|r| Self::to_json(&r))
-            .map_err(|e| e.to_string())
+        let client = self.client_for_file(&params.file_path).await?;
+        tools::widgets::handle_get_widgets(
+            client.as_ref(),
+            &params.file_path,
+            params.line,
+            params.column,
+        )
+        .await
+        .map(|r| Self::to_json(&r))
+        .map_err(|e| e.to_string())
     }
 
     #[tool(
@@ -963,11 +1044,15 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<WidgetSourceParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
-        tools::widgets::handle_get_widget_source(client, &params.file_path, &params.javascript_hash)
-            .await
-            .map(|r| Self::to_json(&r))
-            .map_err(|e| e.to_string())
+        let client = self.client_for_file(&params.file_path).await?;
+        tools::widgets::handle_get_widget_source(
+            client.as_ref(),
+            &params.file_path,
+            &params.javascript_hash,
+        )
+        .await
+        .map(|r| Self::to_json(&r))
+        .map_err(|e| e.to_string())
     }
 
     // ---- Profile Proof ----
@@ -980,12 +1065,12 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<ProfileProofParams>,
     ) -> Result<String, String> {
-        let project_path = self.require_project_path()?;
+        let project_path = self.resolve_project_path(Some(&params.file_path))?;
         let file = PathBuf::from(&params.file_path);
         tools::profile::handle_profile_proof(
             &file,
             params.line,
-            project_path,
+            &project_path,
             params.timeout.unwrap_or(30.0),
             params.top_n.unwrap_or(5),
         )
@@ -1004,8 +1089,8 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<BatchGoalParams>,
     ) -> Result<String, String> {
-        let client = self.ensure_client().await?;
-        tools::batch_goals::handle_lean_goals_batch(client, params.positions)
+        let client = self.client_default().await?;
+        tools::batch_goals::handle_lean_goals_batch(client.as_ref(), params.positions)
             .await
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
@@ -1037,29 +1122,29 @@ impl rmcp::ServerHandler for AppContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn app_context_new_has_no_project_path() {
         let ctx = AppContext::new();
-        assert!(ctx.lean_project_path.is_none());
+        assert!(ctx.explicit_project_path.is_none());
     }
 
     #[test]
     fn app_context_default_matches_new() {
         let ctx = AppContext::default();
-        assert!(ctx.lean_project_path.is_none());
+        assert!(ctx.explicit_project_path.is_none());
     }
 
     #[test]
     fn app_context_with_project_path() {
-        let ctx = AppContext {
-            lean_project_path: Some(PathBuf::from("/tmp/lean-project")),
-            lsp_client: Arc::new(OnceCell::new()),
-            search_config: SearchConfig::default(),
-            tool_router: AppContext::tool_router(),
-        };
+        let ctx = AppContext::with_options(
+            Some(PathBuf::from("/tmp/lean-project")),
+            SearchConfig::default(),
+        );
         assert_eq!(
-            ctx.lean_project_path.as_deref(),
+            ctx.explicit_project_path.as_deref(),
             Some(std::path::Path::new("/tmp/lean-project"))
         );
     }
@@ -1111,29 +1196,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ensure_client_returns_error_without_project_path() {
-        let ctx = AppContext::new();
-        assert!(ctx.ensure_client().await.is_err());
-    }
-
-    #[test]
-    fn require_project_path_returns_error_when_none() {
-        let ctx = AppContext::new();
-        assert!(ctx.require_project_path().is_err());
-    }
-
-    #[test]
-    fn require_project_path_returns_ok_when_set() {
-        let ctx = AppContext {
-            lean_project_path: Some(PathBuf::from("/tmp/test")),
-            lsp_client: Arc::new(OnceCell::new()),
-            search_config: SearchConfig::default(),
-            tool_router: AppContext::tool_router(),
-        };
-        assert!(ctx.require_project_path().is_ok());
-    }
-
     #[test]
     fn to_json_serializes_simple_value() {
         let val = serde_json::json!({"key": "value"});
@@ -1153,6 +1215,93 @@ mod tests {
         let ctx = AppContext::new();
         let debug = format!("{:?}", ctx);
         assert!(debug.contains("AppContext"));
-        assert!(debug.contains("lsp_client"));
+        assert!(debug.contains("explicit_project_path"));
+        assert!(debug.contains("client_count"));
+    }
+
+    // ---- resolve_project_path tests ----
+
+    #[test]
+    fn resolve_project_path_explicit_takes_precedence() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("lakefile.lean"), "-- lakefile").unwrap();
+        let explicit = PathBuf::from("/explicit/path");
+        let ctx = AppContext::with_options(Some(explicit.clone()), SearchConfig::default());
+        // Even with a file_path in a real project, explicit wins
+        let file_in_project = dir.path().join("Foo.lean");
+        fs::write(&file_in_project, "-- code").unwrap();
+        let result = ctx
+            .resolve_project_path(Some(file_in_project.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(result, explicit);
+    }
+
+    #[test]
+    fn resolve_project_path_detects_from_file_path() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("src");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.path().join("lakefile.lean"), "-- lakefile").unwrap();
+        let file = sub.join("Foo.lean");
+        fs::write(&file, "-- code").unwrap();
+        let ctx = AppContext::new();
+        let result = ctx
+            .resolve_project_path(Some(file.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(
+            result.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_project_path_detects_from_cwd() {
+        // When run from the repo root, CWD has lean-toolchain, so detection succeeds.
+        // This test validates that the CWD fallback path works.
+        let ctx = AppContext::new();
+        // The rust-lsp-mcp repo itself has a lean-toolchain file,
+        // so running from the repo root should detect it.
+        // If it doesn't (different CI env), we just check the method doesn't panic.
+        let result = ctx.resolve_project_path(None);
+        // We can't guarantee CWD is in a Lean project, so just check it returns something
+        // or returns the expected error message.
+        match result {
+            Ok(path) => assert!(path.exists()),
+            Err(e) => assert!(e.contains("auto-detection failed")),
+        }
+    }
+
+    #[test]
+    fn resolve_project_path_error_when_nothing_found() {
+        // Use a tempdir that definitely has no Lean project markers above it.
+        let dir = TempDir::new().unwrap();
+        let ctx = AppContext {
+            explicit_project_path: None,
+            clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            // Pre-populate the CWD cache with None to prevent real CWD detection
+            cwd_project: Arc::new(OnceLock::new()),
+            search_config: SearchConfig::default(),
+            tool_router: AppContext::tool_router(),
+        };
+        // Force the CWD cache to None
+        let _ = ctx.cwd_project.set(None);
+        // Use a file path in the tempdir (no markers)
+        let file = dir.path().join("Foo.lean");
+        fs::write(&file, "-- code").unwrap();
+        // The temp dir (/tmp/...) should have no Lean project markers
+        let result = ctx.resolve_project_path(Some(file.to_str().unwrap()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("auto-detection failed"));
+    }
+
+    #[test]
+    fn resolve_project_path_cwd_result_is_cached() {
+        let ctx = AppContext::new();
+        // Pre-populate the CWD cache
+        let test_path = PathBuf::from("/test/cached/path");
+        let _ = ctx.cwd_project.set(Some(test_path.clone()));
+        // Without explicit path or file_path, should return the cached value
+        let result = ctx.resolve_project_path(None).unwrap();
+        assert_eq!(result, test_path);
     }
 }
