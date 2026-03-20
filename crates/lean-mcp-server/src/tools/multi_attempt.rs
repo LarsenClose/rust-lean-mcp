@@ -28,7 +28,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 /// Convert raw LSP diagnostics into [`DiagnosticMessage`] items.
-fn to_diagnostic_messages(diagnostics: &[Value]) -> Vec<DiagnosticMessage> {
+pub fn to_diagnostic_messages(diagnostics: &[Value]) -> Vec<DiagnosticMessage> {
     let mut items = Vec::new();
     for diag in diagnostics {
         let range = diag.get("fullRange").or_else(|| diag.get("range"));
@@ -66,7 +66,7 @@ fn to_diagnostic_messages(diagnostics: &[Value]) -> Vec<DiagnosticMessage> {
 }
 
 /// Filter diagnostics whose range intersects `[start_line, end_line]` (0-indexed).
-fn filter_diagnostics_by_line_range(
+pub fn filter_diagnostics_by_line_range(
     diagnostics: &[Value],
     start_line: u32,
     end_line: u32,
@@ -96,7 +96,7 @@ fn filter_diagnostics_by_line_range(
 /// When `column` is `None`, returns the index of the first non-whitespace
 /// character on the line (or 0 if the line is all whitespace).
 /// When `column` is `Some(c)` (1-indexed), validates the range and returns `c - 1`.
-fn resolve_column(line_text: &str, column: Option<u32>) -> Result<u32, LeanToolError> {
+pub fn resolve_column(line_text: &str, column: Option<u32>) -> Result<u32, LeanToolError> {
     match column {
         None => Ok(line_text.find(|c: char| !c.is_whitespace()).unwrap_or(0) as u32),
         Some(col) => {
@@ -114,7 +114,7 @@ fn resolve_column(line_text: &str, column: Option<u32>) -> Result<u32, LeanToolE
 /// Build the temporary LSP edit and return the goal cursor position.
 ///
 /// Returns `(snippet_str, change_json, goal_line_0, goal_col_0)`.
-fn prepare_edit(
+pub fn prepare_edit(
     line_text: &str,
     target_col: u32,
     snippet: &str,
@@ -367,7 +367,7 @@ async fn lsp_path(
 
 /// Run a single snippet against the warm LSP using edit-and-restore.
 ///
-/// This is the per-snippet body extracted from [`lsp_path`]. It:
+/// This is the per-snippet body extracted from `lsp_path`. It:
 /// 1. Applies the snippet edit at `target_col` on `line`
 /// 2. Gets diagnostics and goals
 /// 3. Restores the original content

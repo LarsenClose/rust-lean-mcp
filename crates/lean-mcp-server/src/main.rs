@@ -1,9 +1,8 @@
 use clap::Parser;
 use lean_mcp_core::config::CliArgs;
+use lean_mcp_server::server;
+use lean_mcp_server::tools;
 use tracing_subscriber::EnvFilter;
-
-mod server;
-mod tools;
 
 #[tokio::main]
 async fn main() {

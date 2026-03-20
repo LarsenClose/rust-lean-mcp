@@ -1159,6 +1159,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
+ "criterion",
  "futures",
  "lean-lsp-client",
  "lean-mcp-core",

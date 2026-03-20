@@ -395,7 +395,7 @@ impl AppContext {
     /// 2. Auto-detect from file_path (walk up looking for project markers)
     /// 3. Auto-detect from CWD (cached)
     /// 4. Error
-    fn resolve_project_path(&self, file_path: Option<&str>) -> Result<PathBuf, String> {
+    pub fn resolve_project_path(&self, file_path: Option<&str>) -> Result<PathBuf, String> {
         // 1. Explicit path
         if let Some(ref pp) = self.explicit_project_path {
             return Ok(pp.clone());
