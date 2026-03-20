@@ -3,7 +3,7 @@
 use crate::helpers::McpTestClient;
 use serde_json::json;
 
-/// All 26 tool names the server must advertise.
+/// All 27 tool names the server must advertise.
 const EXPECTED_TOOLS: &[&str] = &[
     "lean_build",
     "lean_project_health",
@@ -31,10 +31,11 @@ const EXPECTED_TOOLS: &[&str] = &[
     "lean_profile_proof",
     "lean_goals_batch",
     "lean_batch",
+    "lean_task_result",
 ];
 
 #[tokio::test]
-async fn tools_list_returns_all_26_tools() {
+async fn tools_list_returns_all_27_tools() {
     let mut client = McpTestClient::spawn().await;
     client.initialize().await;
 

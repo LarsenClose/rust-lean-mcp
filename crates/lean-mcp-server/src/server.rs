@@ -7,10 +7,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use lean_lsp_client::client::LspClient;
 use lean_lsp_client::lean_client::LeanLspClient;
 use lean_mcp_core::instructions::INSTRUCTIONS;
+use lean_mcp_core::models::AttemptResult;
+use lean_mcp_core::task_manager::TaskManager;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, InitializeResult, ServerCapabilities};
@@ -294,6 +297,14 @@ pub struct ProjectHealthParams {
     pub include_goals: Option<bool>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct TaskResultParams {
+    #[schemars(description = "Task ID returned by lean_multi_attempt_async")]
+    pub task_id: String,
+    #[schemars(description = "Set true to cancel the task and abort remaining work")]
+    pub cancel: Option<bool>,
+}
+
 // ---------------------------------------------------------------------------
 // AppContext
 // ---------------------------------------------------------------------------
@@ -314,6 +325,8 @@ pub struct AppContext {
     cwd_project: Arc<OnceLock<Option<PathBuf>>>,
     /// Search endpoint configuration (URLs for leansearch, loogle, etc.).
     pub search_config: SearchConfig,
+    /// Background task manager for async multi-attempt polling.
+    pub task_manager: Arc<TaskManager<AttemptResult>>,
     /// Tool router for rmcp tool dispatch.
     tool_router: ToolRouter<Self>,
 }
@@ -326,6 +339,7 @@ impl std::fmt::Debug for AppContext {
                 "client_count",
                 &self.clients.try_read().map(|c| c.len()).unwrap_or(0),
             )
+            .field("task_manager", &"TaskManager<AttemptResult>")
             .finish()
     }
 }
@@ -338,6 +352,7 @@ impl AppContext {
             clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             cwd_project: Arc::new(OnceLock::new()),
             search_config: SearchConfig::default(),
+            task_manager: Arc::new(TaskManager::new(Duration::from_secs(300))),
             tool_router: Self::tool_router(),
         }
     }
@@ -349,6 +364,7 @@ impl AppContext {
             clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             cwd_project: Arc::new(OnceLock::new()),
             search_config,
+            task_manager: Arc::new(TaskManager::new(Duration::from_secs(300))),
             tool_router: Self::tool_router(),
         }
     }
@@ -506,7 +522,7 @@ async fn resolve_line(
 }
 
 // ---------------------------------------------------------------------------
-// Tool routing (23 tools)
+// Tool routing (24 tools)
 // ---------------------------------------------------------------------------
 
 #[tool_router]
@@ -1100,6 +1116,44 @@ impl AppContext {
             .map(|r| Self::to_json(&r))
             .map_err(|e| e.to_string())
     }
+
+    // ---- Task Result (background task polling) ----
+
+    #[tool(
+        name = "lean_task_result",
+        description = "Poll background task status. Returns partial results as snippets complete. Set cancel=true to abort."
+    )]
+    async fn lean_task_result(
+        &self,
+        Parameters(params): Parameters<TaskResultParams>,
+    ) -> Result<String, String> {
+        // Handle cancellation
+        if params.cancel == Some(true) {
+            let cancelled = self.task_manager.cancel_task(&params.task_id).await;
+            if !cancelled {
+                return Err(format!("Task '{}' not found", params.task_id));
+            }
+            // Get final snapshot after cancellation
+            let snapshot = self
+                .task_manager
+                .get_task(&params.task_id)
+                .await
+                .ok_or_else(|| format!("Task '{}' not found", params.task_id))?;
+            return Ok(Self::to_json(&snapshot));
+        }
+
+        // Run cleanup on each poll (cheap, keeps memory bounded)
+        self.task_manager.cleanup_expired().await;
+
+        // Get task snapshot
+        let snapshot = self
+            .task_manager
+            .get_task(&params.task_id)
+            .await
+            .ok_or_else(|| format!("Task '{}' not found or expired", params.task_id))?;
+
+        Ok(Self::to_json(&snapshot))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,6 +1340,7 @@ mod tests {
             // Pre-populate the CWD cache with None to prevent real CWD detection
             cwd_project: Arc::new(OnceLock::new()),
             search_config: SearchConfig::default(),
+            task_manager: Arc::new(TaskManager::new(Duration::from_secs(300))),
             tool_router: AppContext::tool_router(),
         };
         // Force the CWD cache to None
@@ -1308,5 +1363,173 @@ mod tests {
         // Without explicit path or file_path, should return the cached value
         let result = ctx.resolve_project_path(None).unwrap();
         assert_eq!(result, test_path);
+    }
+
+    // ---- lean_task_result tests ----
+    // These test the handler logic via task_manager directly (the #[tool] macro
+    // handles deserialization/routing; the logic is in task_manager methods).
+
+    use lean_mcp_core::task_manager::{ItemStatus, TaskStatus};
+
+    #[tokio::test]
+    async fn task_result_not_found() {
+        let ctx = AppContext::new();
+        let result = ctx.task_manager.get_task("nonexistent-id").await;
+        assert!(result.is_none(), "Nonexistent task should return None");
+    }
+
+    #[tokio::test]
+    async fn task_result_returns_snapshot() {
+        let ctx = AppContext::new();
+        let (task_id, _token) = ctx.task_manager.create_task(3).await;
+
+        // Update two items
+        ctx.task_manager
+            .update_item(
+                &task_id,
+                0,
+                ItemStatus::Completed {
+                    result: AttemptResult {
+                        snippet: "simp".into(),
+                        goals: vec!["|- True".into()],
+                        diagnostics: vec![],
+                        timed_out: false,
+                    },
+                },
+            )
+            .await;
+        ctx.task_manager
+            .update_item(
+                &task_id,
+                1,
+                ItemStatus::Failed {
+                    error: "timeout".into(),
+                },
+            )
+            .await;
+
+        let snapshot = ctx.task_manager.get_task(&task_id).await.unwrap();
+        assert_eq!(snapshot.task_id, task_id);
+        assert_eq!(snapshot.status, TaskStatus::Running);
+        assert_eq!(snapshot.total, 3);
+        assert_eq!(snapshot.completed_count, 2);
+        assert!(
+            matches!(&snapshot.items[0], ItemStatus::Completed { result } if result.snippet == "simp")
+        );
+        assert!(matches!(&snapshot.items[1], ItemStatus::Failed { error } if error == "timeout"));
+        assert!(matches!(&snapshot.items[2], ItemStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn task_result_cancel() {
+        let ctx = AppContext::new();
+        let (task_id, token) = ctx.task_manager.create_task(2).await;
+
+        assert!(!token.is_cancelled());
+        let cancelled = ctx.task_manager.cancel_task(&task_id).await;
+        assert!(cancelled);
+        assert!(token.is_cancelled());
+
+        let snapshot = ctx.task_manager.get_task(&task_id).await.unwrap();
+        assert_eq!(snapshot.status, TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn task_result_cancel_unknown_task() {
+        let ctx = AppContext::new();
+        let cancelled = ctx.task_manager.cancel_task("does-not-exist").await;
+        assert!(!cancelled, "Cancelling unknown task should return false");
+    }
+
+    #[tokio::test]
+    async fn task_result_expired_task_not_found() {
+        // TaskManager with 0ms TTL — tasks expire immediately once done.
+        let tm: TaskManager<AttemptResult> = TaskManager::new(Duration::from_millis(0));
+        let (task_id, _token) = tm.create_task(1).await;
+
+        tm.update_item(
+            &task_id,
+            0,
+            ItemStatus::Completed {
+                result: AttemptResult {
+                    snippet: "ring".into(),
+                    goals: vec![],
+                    diagnostics: vec![],
+                    timed_out: false,
+                },
+            },
+        )
+        .await;
+
+        // Let the TTL elapse.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        tm.cleanup_expired().await;
+        assert!(
+            tm.get_task(&task_id).await.is_none(),
+            "Expired task should not be found after cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_result_serializes_attempt_results() {
+        let ctx = AppContext::new();
+        let (task_id, _token) = ctx.task_manager.create_task(2).await;
+
+        ctx.task_manager
+            .update_item(
+                &task_id,
+                0,
+                ItemStatus::Completed {
+                    result: AttemptResult {
+                        snippet: "simp".into(),
+                        goals: vec!["|- True".into()],
+                        diagnostics: vec![],
+                        timed_out: false,
+                    },
+                },
+            )
+            .await;
+        ctx.task_manager
+            .update_item(
+                &task_id,
+                1,
+                ItemStatus::Completed {
+                    result: AttemptResult {
+                        snippet: "ring".into(),
+                        goals: vec![],
+                        diagnostics: vec![],
+                        timed_out: false,
+                    },
+                },
+            )
+            .await;
+
+        let snapshot = ctx.task_manager.get_task(&task_id).await.unwrap();
+        let json = AppContext::to_json(&snapshot);
+
+        // Parse and verify structure
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["task_id"], task_id);
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["total"], 2);
+        assert_eq!(v["completed_count"], 2);
+
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["status"], "Completed");
+        assert_eq!(items[0]["result"]["snippet"], "simp");
+        assert_eq!(items[1]["status"], "Completed");
+        assert_eq!(items[1]["result"]["snippet"], "ring");
+    }
+
+    #[test]
+    fn app_context_debug_includes_task_manager() {
+        let ctx = AppContext::new();
+        let debug = format!("{:?}", ctx);
+        assert!(
+            debug.contains("task_manager"),
+            "Debug output should include task_manager"
+        );
     }
 }
