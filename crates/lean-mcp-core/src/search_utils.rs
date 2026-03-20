@@ -92,7 +92,9 @@ pub fn lean_local_search(
         ));
     }
 
-    // Build regex: match declaration keywords followed by the query
+    // Build regex: match declaration keywords followed by the query.
+    // The pattern matches optional attributes and modifiers before the keyword,
+    // then captures the declaration name containing the query.
     let escaped_query = regex::escape(query);
     let keywords_pattern = DECL_KEYWORDS
         .iter()
@@ -105,17 +107,48 @@ pub fn lean_local_search(
 
     tracing::debug!("Local search pattern: {}", pattern);
 
+    // Resolve to absolute path so ripgrep results have consistent paths
+    let abs_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let max_results = (limit * 10).to_string();
+
+    // Build ripgrep command with flags that search dependency sources.
+    // Key: --no-ignore bypasses .gitignore so .lake/packages/ is included.
+    // Glob patterns include only .lean files and exclude build artifacts.
+    let mut args = vec![
+        "--json",
+        "--no-ignore",
+        "--hidden",
+        "--smart-case",
+        "--color",
+        "never",
+        "--no-messages",
+        "--no-heading",
+        "--max-count",
+        &max_results,
+        "-g",
+        "*.lean",
+        "-g",
+        "!.git/**",
+        "-g",
+        "!.lake/build/**",
+        &pattern,
+    ];
+
+    // Primary search path: the project root (includes .lake/packages/)
+    let root_str = abs_root.to_string_lossy().to_string();
+    args.push(&root_str);
+
+    // Optionally include Lean stdlib source directory
+    let lean_src = get_lean_src_search_path(project_root);
+    if let Some(ref src_path) = lean_src {
+        args.push(src_path);
+    }
+
     // Run ripgrep
     let output = std::process::Command::new("rg")
-        .args([
-            "--json",
-            "--type",
-            "lean",
-            "--no-heading",
-            "--max-count",
-            &(limit * 10).to_string(), // over-fetch for ranking
-            &pattern,
-        ])
+        .args(&args)
         .current_dir(project_root)
         .output()
         .map_err(|e| format!("Failed to run ripgrep: {e}"))?;
@@ -154,11 +187,14 @@ pub fn lean_local_search(
             None => continue,
         };
 
-        let file_path = data
+        let raw_file_path = data
             .get("path")
             .and_then(|p| p.get("text"))
             .and_then(|t| t.as_str())
             .unwrap_or("");
+
+        // Make path relative to project root for display
+        let file_path = make_relative_path(&abs_root, raw_file_path);
 
         let line_text = data
             .get("lines")
@@ -175,7 +211,7 @@ pub fn lean_local_search(
             raw_results.push(RawMatch {
                 name,
                 kind,
-                file: file_path.to_string(),
+                file: file_path,
                 line_number,
             });
         }
@@ -236,6 +272,49 @@ struct ScoredResult {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Convert an absolute file path to a relative path from the project root.
+///
+/// If the path is already relative or cannot be made relative, returns it as-is.
+fn make_relative_path(project_root: &Path, file_path: &str) -> String {
+    let p = Path::new(file_path);
+    if p.is_absolute() {
+        match p.strip_prefix(project_root) {
+            Ok(relative) => relative.to_string_lossy().to_string(),
+            Err(_) => file_path.to_string(),
+        }
+    } else {
+        file_path.to_string()
+    }
+}
+
+/// Get the Lean stdlib source directory, if available.
+///
+/// Runs `lean --print-prefix` from the project root so that elan resolves
+/// the correct toolchain. Returns the path to the `src/` directory if it exists.
+fn get_lean_src_search_path(project_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("lean")
+        .arg("--print-prefix")
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let src_dir = Path::new(&prefix).join("src");
+    if src_dir.is_dir() {
+        Some(src_dir.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
 
 /// Build a regex that captures the declaration name from a Lean source line.
 fn build_name_regex() -> Regex {
@@ -718,6 +797,145 @@ mod tests {
         assert!(DECL_KEYWORDS.contains(&"inductive"));
         assert!(DECL_KEYWORDS.contains(&"instance"));
         assert!(DECL_KEYWORDS.contains(&"abbrev"));
+    }
+
+    // ---- make_relative_path -------------------------------------------------
+
+    #[test]
+    fn make_relative_path_absolute_inside_root() {
+        let root = Path::new("/home/user/project");
+        let result = make_relative_path(root, "/home/user/project/.lake/packages/mathlib/Foo.lean");
+        assert_eq!(result, ".lake/packages/mathlib/Foo.lean");
+    }
+
+    #[test]
+    fn make_relative_path_already_relative() {
+        let root = Path::new("/home/user/project");
+        let result = make_relative_path(root, ".lake/packages/mathlib/Foo.lean");
+        assert_eq!(result, ".lake/packages/mathlib/Foo.lean");
+    }
+
+    #[test]
+    fn make_relative_path_absolute_outside_root() {
+        let root = Path::new("/home/user/project");
+        let result = make_relative_path(root, "/opt/lean/src/Init.lean");
+        assert_eq!(result, "/opt/lean/src/Init.lean");
+    }
+
+    // ---- lean_local_search with .lake/packages/ ----------------------------
+
+    #[test]
+    fn lean_local_search_finds_declarations_in_lake_packages() {
+        let (rg_available, _) = check_ripgrep_status();
+        if !rg_available {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a project-level lean file
+        let project_file = tmp.path().join("Main.lean");
+        fs::write(&project_file, "def myProjectDef : Nat := 42\n").unwrap();
+
+        // Create a simulated .lake/packages/ dependency with a declaration
+        let pkg_dir = tmp.path().join(".lake/packages/mathlib/Mathlib/Data");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        let pkg_file = pkg_dir.join("Nat.lean");
+        fs::write(
+            &pkg_file,
+            "namespace Polynomial\n\ntheorem card_roots (p : Polynomial) : True := trivial\n\nend Polynomial\n",
+        )
+        .unwrap();
+
+        let results = lean_local_search("card_roots", 10, tmp.path()).unwrap();
+        assert!(
+            !results.is_empty(),
+            "Expected to find card_roots in .lake/packages/ but got empty results"
+        );
+        assert_eq!(results[0].name, "Polynomial.card_roots");
+        assert!(results[0].file.contains(".lake/packages/"));
+    }
+
+    #[test]
+    fn lean_local_search_excludes_lake_build_artifacts() {
+        let (rg_available, _) = check_ripgrep_status();
+        if !rg_available {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a build artifact (should be excluded)
+        let build_dir = tmp.path().join(".lake/build/lib");
+        fs::create_dir_all(&build_dir).unwrap();
+        let build_file = build_dir.join("BuildArtifact.lean");
+        fs::write(&build_file, "theorem buildOnlyDecl : True := trivial\n").unwrap();
+
+        // Create a legit project file
+        let project_file = tmp.path().join("Main.lean");
+        fs::write(&project_file, "-- no declarations\n").unwrap();
+
+        let results = lean_local_search("buildOnlyDecl", 10, tmp.path()).unwrap();
+        assert!(
+            results.is_empty(),
+            "Expected .lake/build/ declarations to be excluded, but found: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn lean_local_search_ranks_project_files_over_packages() {
+        let (rg_available, _) = check_ripgrep_status();
+        if !rg_available {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Project-local file with namespace to avoid dedup
+        let project_file = tmp.path().join("MyProject.lean");
+        fs::write(
+            &project_file,
+            "namespace Local\ndef sharedName : Nat := 1\nend Local\n",
+        )
+        .unwrap();
+
+        // Package file with same base declaration name but different namespace
+        let pkg_dir = tmp.path().join(".lake/packages/dep/Dep");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        let pkg_file = pkg_dir.join("Lib.lean");
+        fs::write(
+            &pkg_file,
+            "namespace Dep\ndef sharedName : Nat := 2\nend Dep\n",
+        )
+        .unwrap();
+
+        let results = lean_local_search("sharedName", 10, tmp.path()).unwrap();
+        assert!(
+            results.len() >= 2,
+            "Expected at least 2 results, got {}",
+            results.len()
+        );
+        // Project file should rank first (Local.sharedName from project vs Dep.sharedName from package)
+        assert!(
+            !results[0].file.contains(".lake/packages/"),
+            "Expected project file to rank first, but got: {}",
+            results[0].file
+        );
+    }
+
+    // ---- get_lean_src_search_path ------------------------------------------
+
+    #[test]
+    fn get_lean_src_search_path_returns_option() {
+        // This test just checks the function doesn't panic.
+        // In environments without lean installed, it returns None.
+        let tmp = tempfile::tempdir().unwrap();
+        let result = get_lean_src_search_path(tmp.path());
+        // Either Some(valid_path) or None; both are fine
+        if let Some(ref path) = result {
+            assert!(Path::new(path).exists(), "Path should exist: {}", path);
+        }
     }
 
     // ---- Send + Sync assertions -------------------------------------------
