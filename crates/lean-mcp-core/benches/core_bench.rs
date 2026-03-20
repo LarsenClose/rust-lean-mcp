@@ -1,348 +1,267 @@
-use std::collections::HashMap;
+//! Criterion microbenchmarks for lean-mcp-core hot paths.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lean_mcp_core::models::{
-    BuildResult, CodeAction, CodeActionEdit, CodeActionsResult, CompletionItem, CompletionsResult,
-    DiagnosticMessage, DiagnosticsResult, FileOutline, GoalState, HoverInfo, LineProfile,
-    OutlineEntry, ProofProfileResult, VerifyResult,
-};
-use lean_mcp_core::rate_limit::RateLimiter;
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use std::fs;
+use std::time::Duration;
+use tempfile::TempDir;
+
+use lean_mcp_core::file_utils::{check_stale_imports, detect_lean_project, get_relative_file_path};
+use lean_mcp_core::task_manager::{ItemStatus, TaskManager};
 
 // ---------------------------------------------------------------------------
-// Model serialization round-trips
+// detect_lean_project
 // ---------------------------------------------------------------------------
 
-fn bench_goal_state_roundtrip(c: &mut Criterion) {
-    let gs = GoalState {
-        line_context: "exact Nat.succ_pos n".into(),
-        goals: Some(vec![
-            "0 < Nat.succ n".into(),
-            "∀ (m : Nat), m < n → 0 < m".into(),
-        ]),
-        goals_before: None,
-        goals_after: None,
-    };
-    let json = serde_json::to_string(&gs).unwrap();
-
-    c.bench_function("model_goal_state_serialize", |b| {
-        b.iter(|| serde_json::to_string(black_box(&gs)).unwrap())
-    });
-    c.bench_function("model_goal_state_deserialize", |b| {
-        b.iter(|| serde_json::from_str::<GoalState>(black_box(&json)).unwrap())
-    });
+/// Create a temp directory tree with a lakefile.lean marker at `depth` levels
+/// above the deepest directory. Returns `(TempDir, deepest_path)`.
+fn make_project_tree(depth: usize) -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let mut current = dir.path().to_path_buf();
+    for i in 0..depth {
+        current = current.join(format!("d{i}"));
+    }
+    fs::create_dir_all(&current).unwrap();
+    // Place marker at root
+    fs::write(dir.path().join("lakefile.lean"), "-- lakefile").unwrap();
+    (dir, current)
 }
 
-fn bench_diagnostics_result_roundtrip(c: &mut Criterion) {
-    let dr = DiagnosticsResult {
-        success: false,
-        items: vec![
-            DiagnosticMessage {
-                severity: "error".into(),
-                message: "unknown identifier 'foo'".into(),
-                line: 10,
-                column: 5,
-            },
-            DiagnosticMessage {
-                severity: "warning".into(),
-                message: "unused variable 'x'".into(),
-                line: 15,
-                column: 3,
-            },
-            DiagnosticMessage {
-                severity: "info".into(),
-                message: "declaration uses sorry".into(),
-                line: 20,
-                column: 1,
-            },
-        ],
-        failed_dependencies: vec!["Mathlib.Tactic".into(), "Mathlib.Data.Nat.Basic".into()],
-        stale_olean_warning: None,
-        stale_files: Vec::new(),
-    };
-    let json = serde_json::to_string(&dr).unwrap();
+fn bench_detect_lean_project(c: &mut Criterion) {
+    let mut group = c.benchmark_group("detect_lean_project");
 
-    c.bench_function("model_diagnostics_result_serialize", |b| {
-        b.iter(|| serde_json::to_string(black_box(&dr)).unwrap())
-    });
-    c.bench_function("model_diagnostics_result_deserialize", |b| {
-        b.iter(|| serde_json::from_str::<DiagnosticsResult>(black_box(&json)).unwrap())
-    });
+    for depth in [1, 5, 10] {
+        group.bench_function(format!("depth_{depth}"), |b| {
+            b.iter_batched(
+                || make_project_tree(depth),
+                |(_dir, deepest)| {
+                    let result = detect_lean_project(black_box(&deepest));
+                    assert!(result.is_some());
+                    result
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
 }
 
-fn bench_hover_info_roundtrip(c: &mut Criterion) {
-    let hi = HoverInfo {
-        symbol: "Nat.add".into(),
-        info: "Nat → Nat → Nat\n\nAddition of natural numbers.".into(),
-        diagnostics: vec![DiagnosticMessage {
-            severity: "info".into(),
-            message: "type mismatch".into(),
-            line: 5,
-            column: 10,
-        }],
-    };
-    let json = serde_json::to_string(&hi).unwrap();
+// ---------------------------------------------------------------------------
+// get_relative_file_path
+// ---------------------------------------------------------------------------
 
-    c.bench_function("model_hover_info_serialize", |b| {
-        b.iter(|| serde_json::to_string(black_box(&hi)).unwrap())
+fn bench_get_relative_file_path(c: &mut Criterion) {
+    let mut group = c.benchmark_group("get_relative_file_path");
+
+    // Absolute path under project
+    group.bench_function("absolute_under_project", |b| {
+        b.iter_batched(
+            || {
+                let dir = TempDir::new().unwrap();
+                let sub = dir.path().join("src");
+                fs::create_dir_all(&sub).unwrap();
+                let file = sub.join("Foo.lean");
+                fs::write(&file, "-- foo").unwrap();
+                let file_str = file.to_string_lossy().to_string();
+                let project = dir.path().to_path_buf();
+                (dir, project, file_str)
+            },
+            |(_dir, project, file_str)| {
+                let result = get_relative_file_path(black_box(&project), black_box(&file_str));
+                assert!(result.is_some());
+                result
+            },
+            BatchSize::SmallInput,
+        );
     });
-    c.bench_function("model_hover_info_deserialize", |b| {
-        b.iter(|| serde_json::from_str::<HoverInfo>(black_box(&json)).unwrap())
+
+    // Relative path
+    group.bench_function("relative_path", |b| {
+        b.iter_batched(
+            || {
+                let dir = TempDir::new().unwrap();
+                fs::write(dir.path().join("Main.lean"), "-- main").unwrap();
+                let project = dir.path().to_path_buf();
+                (dir, project)
+            },
+            |(_dir, project)| {
+                let result = get_relative_file_path(black_box(&project), black_box("Main.lean"));
+                assert!(result.is_some());
+                result
+            },
+            BatchSize::SmallInput,
+        );
     });
+
+    group.finish();
 }
 
-fn bench_completions_result_roundtrip(c: &mut Criterion) {
-    let cr = CompletionsResult {
-        items: (0..20)
-            .map(|i| CompletionItem {
-                label: format!("Nat.add_comm_{i}"),
-                kind: Some("Function".into()),
-                detail: Some(format!("∀ (n m : Nat), n + m = m + n (variant {i})")),
+// ---------------------------------------------------------------------------
+// check_stale_imports
+// ---------------------------------------------------------------------------
+
+/// Create a project with N imports, where `stale_count` of them have stale oleans.
+fn make_stale_project(import_count: usize, stale_count: usize) -> (TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    let build_lib = dir.path().join(".lake").join("build").join("lib");
+    fs::create_dir_all(&build_lib).unwrap();
+
+    // Build import lines
+    let mut imports = Vec::new();
+    for i in 0..import_count {
+        let mod_dir = dir.path().join(format!("Mod{i}"));
+        fs::create_dir_all(&mod_dir).unwrap();
+        let mod_build = build_lib.join(format!("Mod{i}"));
+        fs::create_dir_all(&mod_build).unwrap();
+
+        if i < stale_count {
+            // Stale: olean first, then source
+            fs::write(mod_build.join("Impl.olean"), "olean").unwrap();
+            // Ensure mtime difference
+            std::thread::sleep(Duration::from_millis(10));
+            fs::write(mod_dir.join("Impl.lean"), "-- impl").unwrap();
+        } else {
+            // Fresh: source first, then olean
+            fs::write(mod_dir.join("Impl.lean"), "-- impl").unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            fs::write(mod_build.join("Impl.olean"), "olean").unwrap();
+        }
+
+        imports.push(format!("import Mod{i}.Impl"));
+    }
+
+    // The target file
+    let content = format!("{}\n\ndef main := 0\n", imports.join("\n"));
+    fs::write(dir.path().join("Main.lean"), &content).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(build_lib.join("Main.olean"), "olean").unwrap();
+
+    (dir, "Main.lean".to_string())
+}
+
+fn bench_check_stale_imports(c: &mut Criterion) {
+    let mut group = c.benchmark_group("check_stale_imports");
+
+    // 5 imports, none stale
+    group.bench_function("5_imports_0_stale", |b| {
+        b.iter_batched(
+            || make_stale_project(5, 0),
+            |(dir, file)| {
+                let result = check_stale_imports(black_box(dir.path()), black_box(&file));
+                assert!(result.is_empty());
+                result
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // 5 imports, 2 stale
+    group.bench_function("5_imports_2_stale", |b| {
+        b.iter_batched(
+            || make_stale_project(5, 2),
+            |(dir, file)| {
+                let result = check_stale_imports(black_box(dir.path()), black_box(&file));
+                assert_eq!(result.len(), 2);
+                result
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // 5 imports, all stale
+    group.bench_function("5_imports_5_stale", |b| {
+        b.iter_batched(
+            || make_stale_project(5, 5),
+            |(dir, file)| {
+                let result = check_stale_imports(black_box(dir.path()), black_box(&file));
+                assert_eq!(result.len(), 5);
+                result
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// task_manager: create + poll
+// ---------------------------------------------------------------------------
+
+fn bench_task_manager_create_and_poll(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("task_manager_create_and_poll", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mgr: TaskManager<String> = TaskManager::new(black_box(Duration::from_secs(60)));
+                let (id, _token) = mgr.create_task(black_box(5)).await;
+                let snap = mgr.get_task(black_box(&id)).await;
+                assert!(snap.is_some());
+                snap
             })
-            .collect(),
-    };
-    let json = serde_json::to_string(&cr).unwrap();
-
-    c.bench_function("model_completions_result_serialize", |b| {
-        b.iter(|| serde_json::to_string(black_box(&cr)).unwrap())
-    });
-    c.bench_function("model_completions_result_deserialize", |b| {
-        b.iter(|| serde_json::from_str::<CompletionsResult>(black_box(&json)).unwrap())
-    });
-}
-
-fn bench_file_outline_roundtrip(c: &mut Criterion) {
-    let fo = FileOutline {
-        imports: vec![
-            "Mathlib.Tactic".into(),
-            "Mathlib.Data.Nat.Basic".into(),
-            "Mathlib.Order.Lattice".into(),
-        ],
-        declarations: vec![
-            OutlineEntry {
-                name: "MyNamespace".into(),
-                kind: "Ns".into(),
-                start_line: 5,
-                end_line: 100,
-                type_signature: None,
-                children: vec![
-                    OutlineEntry {
-                        name: "myTheorem".into(),
-                        kind: "Thm".into(),
-                        start_line: 10,
-                        end_line: 20,
-                        type_signature: Some("∀ (n : Nat), n + 0 = n".into()),
-                        children: vec![],
-                    },
-                    OutlineEntry {
-                        name: "myDef".into(),
-                        kind: "Def".into(),
-                        start_line: 25,
-                        end_line: 35,
-                        type_signature: Some("Nat → Nat".into()),
-                        children: vec![],
-                    },
-                ],
-            },
-            OutlineEntry {
-                name: "anotherDef".into(),
-                kind: "Def".into(),
-                start_line: 105,
-                end_line: 110,
-                type_signature: Some("String → Bool".into()),
-                children: vec![],
-            },
-        ],
-        total_declarations: Some(3),
-    };
-    let json = serde_json::to_string(&fo).unwrap();
-
-    c.bench_function("model_file_outline_serialize", |b| {
-        b.iter(|| serde_json::to_string(black_box(&fo)).unwrap())
-    });
-    c.bench_function("model_file_outline_deserialize", |b| {
-        b.iter(|| serde_json::from_str::<FileOutline>(black_box(&json)).unwrap())
-    });
-}
-
-fn bench_code_actions_result_roundtrip(c: &mut Criterion) {
-    let car = CodeActionsResult {
-        actions: vec![
-            CodeAction {
-                title: "Try this: simp only [Nat.add_comm, Nat.add_assoc]".into(),
-                is_preferred: true,
-                edits: vec![CodeActionEdit {
-                    new_text: "simp only [Nat.add_comm, Nat.add_assoc]".into(),
-                    start_line: 5,
-                    start_column: 3,
-                    end_line: 5,
-                    end_column: 8,
-                }],
-            },
-            CodeAction {
-                title: "Try this: omega".into(),
-                is_preferred: false,
-                edits: vec![CodeActionEdit {
-                    new_text: "omega".into(),
-                    start_line: 5,
-                    start_column: 3,
-                    end_line: 5,
-                    end_column: 8,
-                }],
-            },
-        ],
-    };
-    let json = serde_json::to_string(&car).unwrap();
-
-    c.bench_function("model_code_actions_result_serialize", |b| {
-        b.iter(|| serde_json::to_string(black_box(&car)).unwrap())
-    });
-    c.bench_function("model_code_actions_result_deserialize", |b| {
-        b.iter(|| serde_json::from_str::<CodeActionsResult>(black_box(&json)).unwrap())
-    });
-}
-
-fn bench_proof_profile_result_roundtrip(c: &mut Criterion) {
-    let mut categories = HashMap::new();
-    categories.insert("elaboration".into(), 42.5);
-    categories.insert("type_checking".into(), 13.2);
-    categories.insert("tactic".into(), 28.8);
-    let ppr = ProofProfileResult {
-        ms: 84.5,
-        lines: vec![
-            LineProfile {
-                line: 10,
-                ms: 42.5,
-                text: "  exact h".into(),
-            },
-            LineProfile {
-                line: 15,
-                ms: 28.8,
-                text: "  simp [Nat.add_comm]".into(),
-            },
-            LineProfile {
-                line: 20,
-                ms: 13.2,
-                text: "  ring".into(),
-            },
-        ],
-        categories,
-    };
-    let json = serde_json::to_string(&ppr).unwrap();
-
-    c.bench_function("model_proof_profile_result_serialize", |b| {
-        b.iter(|| serde_json::to_string(black_box(&ppr)).unwrap())
-    });
-    c.bench_function("model_proof_profile_result_deserialize", |b| {
-        b.iter(|| serde_json::from_str::<ProofProfileResult>(black_box(&json)).unwrap())
-    });
-}
-
-fn bench_verify_result_roundtrip(c: &mut Criterion) {
-    let vr = VerifyResult {
-        axioms: vec![
-            "propext".into(),
-            "Classical.choice".into(),
-            "Quot.sound".into(),
-        ],
-        warnings: vec![],
-    };
-    let json = serde_json::to_string(&vr).unwrap();
-
-    c.bench_function("model_verify_result_serialize", |b| {
-        b.iter(|| serde_json::to_string(black_box(&vr)).unwrap())
-    });
-    c.bench_function("model_verify_result_deserialize", |b| {
-        b.iter(|| serde_json::from_str::<VerifyResult>(black_box(&json)).unwrap())
-    });
-}
-
-fn bench_build_result_roundtrip(c: &mut Criterion) {
-    let br = BuildResult {
-        success: true,
-        output: "Build completed successfully.\nCompiled 42 modules.".into(),
-        errors: vec![],
-    };
-    let json = serde_json::to_string(&br).unwrap();
-
-    c.bench_function("model_build_result_serialize", |b| {
-        b.iter(|| serde_json::to_string(black_box(&br)).unwrap())
-    });
-    c.bench_function("model_build_result_deserialize", |b| {
-        b.iter(|| serde_json::from_str::<BuildResult>(black_box(&json)).unwrap())
+        });
     });
 }
 
 // ---------------------------------------------------------------------------
-// Rate limiter throughput
+// task_manager: update items
 // ---------------------------------------------------------------------------
 
-fn bench_rate_limiter_under_limit(c: &mut Criterion) {
-    c.bench_function("rate_limiter_check_and_record_under_limit", |b| {
-        b.iter(|| {
-            let mut rl = RateLimiter::new();
-            for _ in 0..3 {
-                rl.check_and_record(black_box("leansearch"), 3, 30).unwrap();
-            }
-        })
-    });
-}
+fn bench_task_manager_update_item(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
-fn bench_rate_limiter_at_limit(c: &mut Criterion) {
-    c.bench_function("rate_limiter_check_and_record_at_limit", |b| {
-        b.iter(|| {
-            let mut rl = RateLimiter::new();
-            for _ in 0..10 {
-                rl.check_and_record(black_box("leanfinder"), 10, 30)
-                    .unwrap();
-            }
-            // This call should fail.
-            let _ = rl.check_and_record(black_box("leanfinder"), 10, 30);
-        })
-    });
-}
+    let mut group = c.benchmark_group("task_manager_update_item");
 
-fn bench_rate_limiter_multiple_categories(c: &mut Criterion) {
-    let categories = [
-        "leansearch",
-        "loogle",
-        "leanfinder",
-        "state_search",
-        "hammer",
-    ];
-    c.bench_function("rate_limiter_multiple_categories", |b| {
+    group.bench_function("update_5_items", |b| {
         b.iter(|| {
-            let mut rl = RateLimiter::new();
-            for cat in &categories {
-                for _ in 0..3 {
-                    rl.check_and_record(black_box(cat), 6, 30).unwrap();
+            rt.block_on(async {
+                let mgr: TaskManager<String> = TaskManager::new(Duration::from_secs(60));
+                let (id, _token) = mgr.create_task(5).await;
+
+                for i in 0..5 {
+                    mgr.update_item(
+                        black_box(&id),
+                        black_box(i),
+                        ItemStatus::Completed {
+                            result: format!("result_{i}"),
+                        },
+                    )
+                    .await;
                 }
-            }
-        })
+
+                let snap = mgr.get_task(&id).await.unwrap();
+                assert_eq!(snap.completed_count, 5);
+                snap
+            })
+        });
     });
-}
 
-fn bench_rate_limiter_window_pruning(c: &mut Criterion) {
-    use std::time::{Duration, Instant};
+    group.bench_function("update_20_items", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mgr: TaskManager<String> = TaskManager::new(Duration::from_secs(60));
+                let (id, _token) = mgr.create_task(20).await;
 
-    c.bench_function("rate_limiter_window_pruning", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let mut rl = RateLimiter::new();
-                // Fill via check_and_record then
-                // age-out by using a very short window.
-                for _ in 0..10 {
-                    rl.check_and_record("bench", 100, 3600).unwrap();
+                for i in 0..20 {
+                    mgr.update_item(
+                        black_box(&id),
+                        black_box(i),
+                        ItemStatus::Completed {
+                            result: format!("result_{i}"),
+                        },
+                    )
+                    .await;
                 }
-                // Now time the pruning call with a 0-second window
-                // (all 10 timestamps will be pruned).
-                let start = Instant::now();
-                let _ = rl.check_and_record(black_box("bench"), 100, 0);
-                total += start.elapsed();
-            }
-            total
-        })
+
+                let snap = mgr.get_task(&id).await.unwrap();
+                assert_eq!(snap.completed_count, 20);
+                snap
+            })
+        });
     });
+
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -350,24 +269,12 @@ fn bench_rate_limiter_window_pruning(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 criterion_group!(
-    model_benches,
-    bench_goal_state_roundtrip,
-    bench_diagnostics_result_roundtrip,
-    bench_hover_info_roundtrip,
-    bench_completions_result_roundtrip,
-    bench_file_outline_roundtrip,
-    bench_code_actions_result_roundtrip,
-    bench_proof_profile_result_roundtrip,
-    bench_verify_result_roundtrip,
-    bench_build_result_roundtrip,
+    benches,
+    bench_detect_lean_project,
+    bench_get_relative_file_path,
+    bench_check_stale_imports,
+    bench_task_manager_create_and_poll,
+    bench_task_manager_update_item,
 );
 
-criterion_group!(
-    rate_limiter_benches,
-    bench_rate_limiter_under_limit,
-    bench_rate_limiter_at_limit,
-    bench_rate_limiter_multiple_categories,
-    bench_rate_limiter_window_pruning,
-);
-
-criterion_main!(model_benches, rate_limiter_benches);
+criterion_main!(benches);
