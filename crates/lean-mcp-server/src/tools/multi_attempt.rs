@@ -510,6 +510,18 @@ pub async fn handle_multi_attempt_parallel(
         return Ok(MultiAttemptResult { items: Vec::new() });
     }
 
+    // 0. Ensure file is open before reading content (#90).
+    //    On a cold LSP (file never previously opened), get_file_content will
+    //    fail with "File not open". This mirrors what the non-parallel lsp_path
+    //    does (line 260-266). open_file is idempotent — a no-op if already open.
+    client
+        .open_file(file_path)
+        .await
+        .map_err(|e| LeanToolError::LspError {
+            operation: "open_file".into(),
+            message: e.to_string(),
+        })?;
+
     // 1. Read file content to extract base code
     let content =
         client
@@ -1663,6 +1675,428 @@ mod tests {
             vec!["|- False"],
             "multi-line snippet should have each line indented, goal at indent + last_line_len"
         );
+    }
+
+    // ========================================================================
+    // Regression tests for #90: parallel cold file open
+    // ========================================================================
+
+    /// Mock LSP client that tracks whether `open_file` is called on the
+    /// *source* file (not temp files). Simulates a cold LSP where
+    /// `get_file_content` fails unless `open_file` was called first.
+    struct MockColdFileClient {
+        project: PathBuf,
+        content: String,
+        /// Tracks all paths passed to `open_file`.
+        open_file_calls: Mutex<Vec<String>>,
+        diagnostics_response: Value,
+        goal_responses: Vec<((u32, u32), Option<Value>)>,
+        close_called: Mutex<Vec<String>>,
+    }
+
+    impl MockColdFileClient {
+        fn new(project: PathBuf, content: &str) -> Self {
+            Self {
+                project,
+                content: content.to_string(),
+                open_file_calls: Mutex::new(Vec::new()),
+                diagnostics_response: json!({
+                    "diagnostics": [],
+                    "success": true
+                }),
+                goal_responses: Vec::new(),
+                close_called: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LspClient for MockColdFileClient {
+        fn project_path(&self) -> &Path {
+            &self.project
+        }
+        async fn open_file(&self, p: &str) -> Result<(), lean_lsp_client::client::LspClientError> {
+            self.open_file_calls.lock().unwrap().push(p.to_string());
+            Ok(())
+        }
+        async fn open_file_force(
+            &self,
+            _p: &str,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn get_file_content(
+            &self,
+            p: &str,
+        ) -> Result<String, lean_lsp_client::client::LspClientError> {
+            // Simulate cold LSP: if the file hasn't been opened, fail.
+            // Temp files (starting with _mcp_attempt_) are always "open".
+            if !p.starts_with("_mcp_attempt_") {
+                let calls = self.open_file_calls.lock().unwrap();
+                if !calls.contains(&p.to_string()) {
+                    return Err(lean_lsp_client::client::LspClientError::FileNotOpen(
+                        p.to_string(),
+                    ));
+                }
+            }
+            Ok(self.content.clone())
+        }
+        async fn update_file(
+            &self,
+            _p: &str,
+            _c: Vec<Value>,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn update_file_content(
+            &self,
+            _p: &str,
+            _c: &str,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn close_files(
+            &self,
+            paths: &[String],
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            self.close_called
+                .lock()
+                .unwrap()
+                .extend(paths.iter().cloned());
+            Ok(())
+        }
+        async fn get_diagnostics(
+            &self,
+            _p: &str,
+            _sl: Option<u32>,
+            _el: Option<u32>,
+            _t: Option<f64>,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(self.diagnostics_response.clone())
+        }
+        async fn get_interactive_diagnostics(
+            &self,
+            _p: &str,
+            _sl: Option<u32>,
+            _el: Option<u32>,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_goal(
+            &self,
+            _p: &str,
+            line: u32,
+            column: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            for ((l, c), resp) in &self.goal_responses {
+                if *l == line && *c == column {
+                    return Ok(resp.clone());
+                }
+            }
+            Ok(None)
+        }
+        async fn get_term_goal(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_hover(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_completions(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_declarations(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_references(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+            _d: bool,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_document_symbols(
+            &self,
+            _p: &str,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_code_actions(
+            &self,
+            _p: &str,
+            _sl: u32,
+            _sc: u32,
+            _el: u32,
+            _ec: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_code_action_resolve(
+            &self,
+            _a: Value,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({}))
+        }
+        async fn get_widgets(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_widget_source(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+            _h: &str,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({}))
+        }
+        async fn shutdown(&self) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+    }
+
+    /// Regression test for #90: parallel multi_attempt must call open_file
+    /// on the source file before calling get_file_content, so that cold
+    /// (never-previously-opened) files work correctly.
+    #[tokio::test]
+    async fn regression_parallel_cold_file_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockColdFileClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        );
+
+        let snippets = vec!["simp".to_string()];
+        // This would fail with "File not open" before the fix
+        let result =
+            handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets).await;
+
+        // Must succeed (not error with "File not open")
+        let result =
+            result.expect("parallel multi_attempt should open file before reading content");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].snippet, "simp");
+
+        // Verify open_file was called with the source file path
+        let calls = client.open_file_calls.lock().unwrap();
+        assert!(
+            calls.contains(&"Main.lean".to_string()),
+            "open_file must be called on the source file; calls were: {calls:?}"
+        );
+    }
+
+    /// Mock that errors on open_file for the source file.
+    struct MockOpenFileErrorClient {
+        project: PathBuf,
+    }
+
+    #[async_trait]
+    impl LspClient for MockOpenFileErrorClient {
+        fn project_path(&self) -> &Path {
+            &self.project
+        }
+        async fn open_file(&self, p: &str) -> Result<(), lean_lsp_client::client::LspClientError> {
+            // Temp files succeed, source file fails
+            if !p.starts_with("_mcp_attempt_") {
+                return Err(lean_lsp_client::client::LspClientError::FileNotOpen(
+                    format!("Cannot open file: {p}"),
+                ));
+            }
+            Ok(())
+        }
+        async fn open_file_force(
+            &self,
+            _p: &str,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn get_file_content(
+            &self,
+            _p: &str,
+        ) -> Result<String, lean_lsp_client::client::LspClientError> {
+            Ok("theorem foo : True := by\n  sorry".to_string())
+        }
+        async fn update_file(
+            &self,
+            _p: &str,
+            _c: Vec<Value>,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn update_file_content(
+            &self,
+            _p: &str,
+            _c: &str,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn close_files(
+            &self,
+            _p: &[String],
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn get_diagnostics(
+            &self,
+            _p: &str,
+            _sl: Option<u32>,
+            _el: Option<u32>,
+            _t: Option<f64>,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({"diagnostics": [], "success": true}))
+        }
+        async fn get_interactive_diagnostics(
+            &self,
+            _p: &str,
+            _sl: Option<u32>,
+            _el: Option<u32>,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_goal(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_term_goal(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_hover(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_completions(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_declarations(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_references(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+            _d: bool,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_document_symbols(
+            &self,
+            _p: &str,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_code_actions(
+            &self,
+            _p: &str,
+            _sl: u32,
+            _sc: u32,
+            _el: u32,
+            _ec: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_code_action_resolve(
+            &self,
+            _a: Value,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({}))
+        }
+        async fn get_widgets(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_widget_source(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+            _h: &str,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({}))
+        }
+        async fn shutdown(&self) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+    }
+
+    /// Test that when open_file fails, the error propagates correctly
+    /// as a LeanToolError::LspError with operation "open_file".
+    #[tokio::test]
+    async fn parallel_open_file_error_propagates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockOpenFileErrorClient {
+            project: dir.path().to_path_buf(),
+        };
+
+        let snippets = vec!["simp".to_string()];
+        let err = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap_err();
+
+        match err {
+            LeanToolError::LspError {
+                operation, message, ..
+            } => {
+                assert_eq!(operation, "open_file");
+                assert!(
+                    message.contains("Cannot open file"),
+                    "error message should contain the original error: {message}"
+                );
+            }
+            other => panic!("expected LspError with operation='open_file', got: {other}"),
+        }
     }
 
     // ---- Parallel: sorry line uses target line indent (not hardcoded) ----
