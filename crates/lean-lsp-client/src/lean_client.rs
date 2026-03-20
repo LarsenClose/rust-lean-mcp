@@ -172,21 +172,41 @@ impl LspClient for LeanLspClient {
     }
 
     async fn open_file(&self, relative_path: &str) -> Result<(), LspClientError> {
-        let mut files = self.open_files.lock().await;
-        if files.contains_key(relative_path) {
-            return Ok(());
-        }
         let abs = self.project_path.join(relative_path);
-        let content = tokio::fs::read_to_string(&abs)
+        let disk_content = tokio::fs::read_to_string(&abs)
             .await
             .map_err(|e| LspClientError::Transport(TransportError::Io(e)))?;
 
+        let mut files = self.open_files.lock().await;
+
+        if let Some(state) = files.get_mut(relative_path) {
+            // File already open — check if disk content has changed
+            if disk_content != state.content {
+                state.version += 1;
+                state.content = disk_content.clone();
+
+                let params = json!({
+                    "textDocument": {
+                        "uri": path_to_uri(&self.project_path, relative_path),
+                        "version": state.version,
+                    },
+                    "contentChanges": [{"text": disk_content}],
+                });
+                self.multiplexer
+                    .notify("textDocument/didChange", Some(params))
+                    .await
+                    .map_err(mux_err)?;
+            }
+            return Ok(());
+        }
+
+        // First open — send didOpen
         let params = json!({
             "textDocument": {
                 "uri": path_to_uri(&self.project_path, relative_path),
                 "languageId": "lean4",
                 "version": 1,
-                "text": content,
+                "text": disk_content,
             }
         });
         self.multiplexer
@@ -198,7 +218,7 @@ impl LspClient for LeanLspClient {
             relative_path.to_string(),
             FileState {
                 version: 1,
-                content,
+                content: disk_content,
             },
         );
         Ok(())
@@ -1018,6 +1038,106 @@ mod tests {
             assert_eq!(notif["method"], "exit");
         });
         assert!(result.is_ok());
+    }
+
+    // ── Error handling ────────────────────────────────────────────────
+
+    // ── open_file stale content detection (#106) ──────────────────
+
+    #[tokio::test]
+    async fn regression_open_file_detects_disk_change() {
+        let (client, mut sr, _sw, dir) = setup().await;
+
+        // First open: sends didOpen with "version 1"
+        std::fs::write(dir.path().join("S.lean"), "version 1").unwrap();
+        client.open_file("S.lean").await.unwrap();
+        let did_open = read_message(&mut sr).await.unwrap();
+        assert_eq!(did_open["method"], "textDocument/didOpen");
+        assert_eq!(did_open["params"]["textDocument"]["text"], "version 1");
+
+        // External change on disk
+        std::fs::write(dir.path().join("S.lean"), "version 2").unwrap();
+
+        // Second open: should detect change and send didChange
+        client.open_file("S.lean").await.unwrap();
+        let did_change = read_message(&mut sr).await.unwrap();
+        assert_eq!(did_change["method"], "textDocument/didChange");
+        assert_eq!(
+            did_change["params"]["contentChanges"][0]["text"],
+            "version 2"
+        );
+        assert_eq!(did_change["params"]["textDocument"]["version"], 2);
+    }
+
+    #[tokio::test]
+    async fn open_file_unchanged_content_no_notification() {
+        let (client, mut sr, _sw, dir) = setup().await;
+
+        std::fs::write(dir.path().join("NoChange.lean"), "same").unwrap();
+        client.open_file("NoChange.lean").await.unwrap();
+        let _ = read_message(&mut sr).await.unwrap(); // drain didOpen
+
+        // Re-open without changing disk content — no notification expected
+        client.open_file("NoChange.lean").await.unwrap();
+
+        // Verify cached content is still correct (no stale state)
+        assert_eq!(
+            client.get_file_content("NoChange.lean").await.unwrap(),
+            "same"
+        );
+
+        // If a didChange was sent, the server side would have a message
+        // waiting. We verify there's nothing by checking via a timeout.
+        let read_result =
+            tokio::time::timeout(Duration::from_millis(100), read_message(&mut sr)).await;
+        assert!(
+            read_result.is_err(),
+            "Expected no message but got one: {:?}",
+            read_result
+        );
+    }
+
+    #[tokio::test]
+    async fn open_file_disk_change_updates_cached_content() {
+        let (client, mut sr, _sw, dir) = setup().await;
+
+        std::fs::write(dir.path().join("Cache.lean"), "old").unwrap();
+        client.open_file("Cache.lean").await.unwrap();
+        let _ = read_message(&mut sr).await.unwrap(); // drain didOpen
+
+        // Change disk content
+        std::fs::write(dir.path().join("Cache.lean"), "new").unwrap();
+
+        // Re-open should update the cached content
+        client.open_file("Cache.lean").await.unwrap();
+        let _ = read_message(&mut sr).await.unwrap(); // drain didChange
+
+        // get_file_content reads from cache — should return "new"
+        assert_eq!(client.get_file_content("Cache.lean").await.unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn open_file_disk_change_increments_version() {
+        let (client, mut sr, _sw, dir) = setup().await;
+
+        std::fs::write(dir.path().join("Ver.lean"), "v1").unwrap();
+        client.open_file("Ver.lean").await.unwrap();
+        let did_open = read_message(&mut sr).await.unwrap();
+        assert_eq!(did_open["params"]["textDocument"]["version"], 1);
+
+        // First disk change → version 2
+        std::fs::write(dir.path().join("Ver.lean"), "v2").unwrap();
+        client.open_file("Ver.lean").await.unwrap();
+        let msg1 = read_message(&mut sr).await.unwrap();
+        assert_eq!(msg1["method"], "textDocument/didChange");
+        assert_eq!(msg1["params"]["textDocument"]["version"], 2);
+
+        // Second disk change → version 3
+        std::fs::write(dir.path().join("Ver.lean"), "v3").unwrap();
+        client.open_file("Ver.lean").await.unwrap();
+        let msg2 = read_message(&mut sr).await.unwrap();
+        assert_eq!(msg2["method"], "textDocument/didChange");
+        assert_eq!(msg2["params"]["textDocument"]["version"], 3);
     }
 
     // ── Error handling ────────────────────────────────────────────────
