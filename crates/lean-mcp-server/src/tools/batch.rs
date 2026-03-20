@@ -129,6 +129,7 @@ struct MultiAttemptArgs {
     snippets: Vec<String>,
     column: Option<u32>,
     parallel: Option<bool>,
+    timeout_per_snippet: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -359,6 +360,7 @@ async fn dispatch_inner(
                 &a.snippets,
                 a.column,
                 a.parallel,
+                a.timeout_per_snippet,
             )
             .await
             .map_err(|e| e.to_string())?;

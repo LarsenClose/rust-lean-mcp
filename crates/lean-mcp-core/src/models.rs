@@ -209,6 +209,9 @@ pub struct AttemptResult {
     /// Diagnostics for this attempt.
     #[serde(default)]
     pub diagnostics: Vec<DiagnosticMessage>,
+    /// Whether the snippet timed out before completing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timed_out: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,6 +1163,50 @@ mod tests {
         assert!(phr.sorries.is_empty());
         assert!(phr.errors.is_empty());
         assert!(phr.success);
+    }
+
+    #[test]
+    fn attempt_result_timed_out_false_omitted() {
+        let ar = AttemptResult {
+            snippet: "simp".into(),
+            goals: vec![],
+            diagnostics: vec![],
+            timed_out: false,
+        };
+        let v: Value = serde_json::to_value(&ar).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("timed_out"),
+            "timed_out=false should be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn attempt_result_timed_out_true_included() {
+        let ar = AttemptResult {
+            snippet: "exact?".into(),
+            goals: vec![],
+            diagnostics: vec![DiagnosticMessage {
+                severity: "warning".into(),
+                message: "Tactic timed out after 5s".into(),
+                line: 0,
+                column: 0,
+            }],
+            timed_out: true,
+        };
+        let v: Value = serde_json::to_value(&ar).unwrap();
+        assert_eq!(
+            v.as_object().unwrap().get("timed_out"),
+            Some(&json!(true)),
+            "timed_out=true should be included in JSON"
+        );
+    }
+
+    #[test]
+    fn attempt_result_timed_out_defaults_to_false() {
+        // When timed_out is missing from JSON, it should default to false
+        let ar: AttemptResult =
+            serde_json::from_str(r#"{"snippet":"simp","goals":[],"diagnostics":[]}"#).unwrap();
+        assert!(!ar.timed_out);
     }
 
     #[test]

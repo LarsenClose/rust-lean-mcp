@@ -144,6 +144,10 @@ pub struct MultiAttemptParams {
         description = "When true, test each snippet via independent temp files (no file mutation, concurrent execution). Omit or false for default REPL/LSP path"
     )]
     pub parallel: Option<bool>,
+    #[schemars(
+        description = "Max seconds per snippet (returns 'timeout' for slow tactics). Only applies to parallel mode"
+    )]
+    pub timeout_per_snippet: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -805,7 +809,7 @@ impl AppContext {
 
     #[tool(
         name = "lean_multi_attempt",
-        description = "Try multiple tactics without modifying file. Returns goal state for each."
+        description = "Try multiple tactics without modifying file. Returns goal state for each. Set timeout_per_snippet (seconds) in parallel mode to cap slow tactics."
     )]
     async fn lean_multi_attempt(
         &self,
@@ -820,6 +824,7 @@ impl AppContext {
             &params.snippets,
             params.column,
             params.parallel,
+            params.timeout_per_snippet,
         )
         .await
         .map(|r| Self::to_json(&r))
