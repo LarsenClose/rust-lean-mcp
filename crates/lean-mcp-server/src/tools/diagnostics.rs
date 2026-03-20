@@ -4,9 +4,12 @@
 //! file. Supports line-range filtering, declaration-name filtering, severity
 //! filtering, interactive mode, and build-error extraction.
 
+use std::path::Path;
+
 use lean_lsp_client::client::LspClient;
 use lean_lsp_client::types::severity;
 use lean_mcp_core::error::LeanToolError;
+use lean_mcp_core::file_utils::check_stale_imports;
 use lean_mcp_core::models::{DiagnosticMessage, DiagnosticsResult, InteractiveDiagnosticsResult};
 use regex::Regex;
 use serde_json::Value;
@@ -113,6 +116,8 @@ fn process_diagnostics(
         success: build_success,
         items,
         failed_dependencies: failed_deps,
+        stale_olean_warning: None,
+        stale_files: Vec::new(),
     }
 }
 
@@ -123,12 +128,20 @@ fn process_diagnostics(
 /// Handle a `lean_diagnostic_messages` tool call.
 ///
 /// Supports line-range filtering, declaration-name filtering, severity
-/// filtering, interactive mode, and build-error extraction.
+/// filtering, interactive mode, build-error extraction, and stale olean
+/// detection.
 ///
 /// `start_line` and `end_line` are **1-indexed** (matching the MCP tool
 /// interface). They are converted to 0-indexed for LSP calls internally.
+///
+/// When diagnostics contain no errors, the handler checks whether the target
+/// file or its direct imports have oleans older than their source. If stale
+/// oleans are found, a warning is included in the result so the caller knows
+/// that "clean" diagnostics may be unreliable.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_diagnostics(
     client: &dyn LspClient,
+    project_path: &Path,
     file_path: &str,
     start_line: Option<u32>,
     end_line: Option<u32>,
@@ -190,7 +203,25 @@ pub async fn handle_diagnostics(
         .unwrap_or_default();
     let build_success = raw.get("success").and_then(Value::as_bool).unwrap_or(true);
 
-    let result = process_diagnostics(&diagnostics_arr, build_success, severity_filter);
+    let mut result = process_diagnostics(&diagnostics_arr, build_success, severity_filter);
+
+    // 6. Stale olean check: only when no errors reported (the dangerous case).
+    let has_errors = result.items.iter().any(|item| item.severity == "error");
+    if !has_errors {
+        let stale = check_stale_imports(project_path, file_path);
+        if !stale.is_empty() {
+            let warning = format!(
+                "WARNING: {} source file(s) are newer than their oleans (e.g., {}). \
+                 Diagnostics may be unreliable — the LSP uses cached oleans for imports. \
+                 Call `lean_build` to rebuild, then re-check diagnostics.",
+                stale.len(),
+                stale.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            );
+            result.stale_olean_warning = Some(warning);
+            result.stale_files = stale;
+        }
+    }
+
     serde_json::to_value(&result).map_err(|e| LeanToolError::Other(e.to_string()))
 }
 
@@ -546,9 +577,18 @@ mod tests {
             false,
         );
 
-        let result = handle_diagnostics(&client, "Main.lean", None, None, None, false, None)
-            .await
-            .unwrap();
+        let result = handle_diagnostics(
+            &client,
+            Path::new("/test/project"),
+            "Main.lean",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
 
         let dr: DiagnosticsResult = serde_json::from_value(result).unwrap();
         assert!(!dr.success);
@@ -564,9 +604,18 @@ mod tests {
             vec![json!({"severity": 1, "message": {"tag": "text", "text": "err"}})];
         let client = MockDiagClient::new().with_interactive(interactive_diags.clone());
 
-        let result = handle_diagnostics(&client, "Main.lean", None, None, None, true, None)
-            .await
-            .unwrap();
+        let result = handle_diagnostics(
+            &client,
+            Path::new("/test/project"),
+            "Main.lean",
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
 
         let ir: InteractiveDiagnosticsResult = serde_json::from_value(result).unwrap();
         assert_eq!(ir.diagnostics.len(), 1);
@@ -596,10 +645,18 @@ mod tests {
                 true,
             );
 
-        let result =
-            handle_diagnostics(&client, "Main.lean", None, None, Some("myThm"), false, None)
-                .await
-                .unwrap();
+        let result = handle_diagnostics(
+            &client,
+            Path::new("/test/project"),
+            "Main.lean",
+            None,
+            None,
+            Some("myThm"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
 
         let dr: DiagnosticsResult = serde_json::from_value(result).unwrap();
         assert!(dr.success);
@@ -612,6 +669,7 @@ mod tests {
 
         let err = handle_diagnostics(
             &client,
+            Path::new("/test/project"),
             "Main.lean",
             None,
             None,
@@ -634,13 +692,139 @@ mod tests {
     async fn diagnostics_empty_file_returns_success() {
         let client = MockDiagClient::new();
 
-        let result = handle_diagnostics(&client, "Empty.lean", None, None, None, false, None)
-            .await
-            .unwrap();
+        let result = handle_diagnostics(
+            &client,
+            Path::new("/test/project"),
+            "Empty.lean",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
 
         let dr: DiagnosticsResult = serde_json::from_value(result).unwrap();
         assert!(dr.success);
         assert!(dr.items.is_empty());
         assert!(dr.failed_dependencies.is_empty());
+    }
+
+    // ---- stale olean integration tests ----
+
+    #[tokio::test]
+    async fn diagnostics_includes_stale_warning_when_no_errors() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let build_lib = dir.path().join(".lake/build/lib");
+        fs::create_dir_all(&build_lib).unwrap();
+
+        // Create olean first, then source (source newer => stale)
+        fs::write(build_lib.join("Main.olean"), "olean").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(dir.path().join("Main.lean"), "-- main").unwrap();
+
+        let client = MockDiagClient::new(); // returns empty diagnostics (success=true)
+
+        let result = handle_diagnostics(
+            &client,
+            dir.path(),
+            "Main.lean",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let dr: DiagnosticsResult = serde_json::from_value(result).unwrap();
+        assert!(dr.success);
+        assert!(dr.stale_olean_warning.is_some());
+        assert!(dr.stale_olean_warning.unwrap().contains("WARNING"));
+        assert_eq!(dr.stale_files, vec!["Main.lean"]);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_no_stale_warning_when_errors_present() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let build_lib = dir.path().join(".lake/build/lib");
+        fs::create_dir_all(&build_lib).unwrap();
+
+        // Stale olean
+        fs::write(build_lib.join("Main.olean"), "olean").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(dir.path().join("Main.lean"), "-- main").unwrap();
+
+        // Client returns an error diagnostic
+        let client = MockDiagClient::new().with_diagnostics(
+            vec![json!({
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+                "severity": 1,
+                "message": "unknown identifier"
+            })],
+            false,
+        );
+
+        let result = handle_diagnostics(
+            &client,
+            dir.path(),
+            "Main.lean",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let dr: DiagnosticsResult = serde_json::from_value(result).unwrap();
+        assert!(!dr.success);
+        // When errors are present, stale check is skipped
+        assert!(dr.stale_olean_warning.is_none());
+        assert!(dr.stale_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_no_stale_warning_when_oleans_fresh() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let build_lib = dir.path().join(".lake/build/lib");
+        fs::create_dir_all(&build_lib).unwrap();
+
+        // Source first, then olean (olean newer => fresh)
+        fs::write(dir.path().join("Main.lean"), "-- main").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(build_lib.join("Main.olean"), "olean").unwrap();
+
+        let client = MockDiagClient::new();
+
+        let result = handle_diagnostics(
+            &client,
+            dir.path(),
+            "Main.lean",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let dr: DiagnosticsResult = serde_json::from_value(result).unwrap();
+        assert!(dr.success);
+        assert!(dr.stale_olean_warning.is_none());
+        assert!(dr.stale_files.is_empty());
     }
 }

@@ -308,8 +308,10 @@ async fn dispatch_inner(
         "lean_diagnostic_messages" => {
             let a: DiagnosticsArgs = deser(args)?;
             let c = require_client(client)?;
+            let pp = project_path.unwrap_or(Path::new("."));
             let r = super::diagnostics::handle_diagnostics(
                 c,
+                pp,
                 &a.file_path,
                 a.start_line,
                 a.end_line,

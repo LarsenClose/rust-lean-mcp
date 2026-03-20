@@ -56,6 +56,8 @@ fn bench_diagnostics_result_roundtrip(c: &mut Criterion) {
             },
         ],
         failed_dependencies: vec!["Mathlib.Tactic".into(), "Mathlib.Data.Nat.Basic".into()],
+        stale_olean_warning: None,
+        stale_files: Vec::new(),
     };
     let json = serde_json::to_string(&dr).unwrap();
 
