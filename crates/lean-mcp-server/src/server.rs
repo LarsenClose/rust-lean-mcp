@@ -1,7 +1,7 @@
 //! MCP server setup and tool routing.
 //!
 //! Defines [`AppContext`] for shared server state and implements the rmcp
-//! `ServerHandler` trait with all 23 tool handlers wired to the MCP protocol.
+//! `ServerHandler` trait with all 24 tool handlers wired to the MCP protocol.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -150,6 +150,20 @@ pub struct MultiAttemptParams {
     #[schemars(
         description = "Max seconds per snippet (returns 'timeout' for slow tactics). Only applies to parallel mode"
     )]
+    pub timeout_per_snippet: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MultiAttemptAsyncParams {
+    #[schemars(description = "Absolute or project-root-relative path to Lean file")]
+    pub file_path: String,
+    #[schemars(description = "Line number (1-indexed)")]
+    pub line: u32,
+    #[schemars(description = "Tactics to try (3+ recommended)")]
+    pub snippets: Vec<String>,
+    #[schemars(description = "Column (1-indexed). Omit to target the tactic line")]
+    pub column: Option<u32>,
+    #[schemars(description = "Max seconds per snippet (returns 'timeout' for slow tactics)")]
     pub timeout_per_snippet: Option<f64>,
 }
 
@@ -847,6 +861,94 @@ impl AppContext {
         .map_err(|e| e.to_string())
     }
 
+    // ---- Multi-Attempt Async ----
+
+    #[tool(
+        name = "lean_multi_attempt_async",
+        description = "Submit background tactic attempts. Returns task_id immediately. Poll with lean_task_result."
+    )]
+    async fn lean_multi_attempt_async(
+        &self,
+        Parameters(params): Parameters<MultiAttemptAsyncParams>,
+    ) -> Result<String, String> {
+        // column is accepted for API compatibility but unused in the async/parallel path
+        let _ = params.column;
+
+        let client = self.client_for_file(&params.file_path).await?;
+        let project_path = client.project_path().to_path_buf();
+
+        // Ensure file is open before reading content (#90)
+        client
+            .open_file(&params.file_path)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let content = client
+            .get_file_content(&params.file_path)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let lines: Vec<&str> = content.lines().collect();
+        if params.line == 0 || params.line as usize > lines.len() {
+            return Err(format!(
+                "Line {} out of range (file has {} lines)",
+                params.line,
+                lines.len()
+            ));
+        }
+
+        let base_code = lines[..params.line as usize - 1].join("\n");
+        let target_line = lines[(params.line - 1) as usize];
+        let indent_len = target_line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let indent = target_line[..indent_len].to_string();
+
+        // Create task
+        let (task_id, cancel_token) = self.task_manager.create_task(params.snippets.len()).await;
+
+        // Spawn each snippet as an independent background task
+        let timeout = params.timeout_per_snippet;
+        for (i, snippet) in params.snippets.iter().enumerate() {
+            let client = client.clone();
+            let project_path = project_path.clone();
+            let base_code = base_code.clone();
+            let indent = indent.clone();
+            let task_manager = self.task_manager.clone();
+            let task_id = task_id.clone();
+            let snippet = snippet.clone();
+            let cancel_token = cancel_token.clone();
+
+            tokio::spawn(async move {
+                use lean_mcp_core::task_manager::ItemStatus;
+
+                if cancel_token.is_cancelled() {
+                    return;
+                }
+
+                let result = crate::tools::multi_attempt::run_snippet_isolated(
+                    client.as_ref(),
+                    &project_path,
+                    &snippet,
+                    &base_code,
+                    &indent,
+                    timeout,
+                )
+                .await;
+
+                task_manager
+                    .update_item(&task_id, i, ItemStatus::Completed { result })
+                    .await;
+            });
+        }
+
+        // Return immediately with task ID
+        Ok(serde_json::to_string(&serde_json::json!({
+            "task_id": task_id,
+            "status": "submitted",
+            "total": params.snippets.len()
+        }))
+        .unwrap())
+    }
+
     // ---- Run Code ----
 
     #[tool(
@@ -1366,8 +1468,6 @@ mod tests {
     }
 
     // ---- lean_task_result tests ----
-    // These test the handler logic via task_manager directly (the #[tool] macro
-    // handles deserialization/routing; the logic is in task_manager methods).
 
     use lean_mcp_core::task_manager::{ItemStatus, TaskStatus};
 
@@ -1383,7 +1483,6 @@ mod tests {
         let ctx = AppContext::new();
         let (task_id, _token) = ctx.task_manager.create_task(3).await;
 
-        // Update two items
         ctx.task_manager
             .update_item(
                 &task_id,
@@ -1443,7 +1542,6 @@ mod tests {
 
     #[tokio::test]
     async fn task_result_expired_task_not_found() {
-        // TaskManager with 0ms TTL — tasks expire immediately once done.
         let tm: TaskManager<AttemptResult> = TaskManager::new(Duration::from_millis(0));
         let (task_id, _token) = tm.create_task(1).await;
 
@@ -1461,7 +1559,6 @@ mod tests {
         )
         .await;
 
-        // Let the TTL elapse.
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         tm.cleanup_expired().await;
@@ -1508,7 +1605,6 @@ mod tests {
         let snapshot = ctx.task_manager.get_task(&task_id).await.unwrap();
         let json = AppContext::to_json(&snapshot);
 
-        // Parse and verify structure
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["task_id"], task_id);
         assert_eq!(v["status"], "completed");
@@ -1531,5 +1627,67 @@ mod tests {
             debug.contains("task_manager"),
             "Debug output should include task_manager"
         );
+    }
+
+    // ---- lean_multi_attempt_async integration tests ----
+
+    #[tokio::test]
+    async fn task_manager_in_app_context() {
+        let ctx = AppContext::new();
+        let (task_id, _token) = ctx.task_manager.create_task(3).await;
+        let snap = ctx.task_manager.get_task(&task_id).await.unwrap();
+        assert_eq!(snap.total, 3);
+        assert_eq!(snap.completed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn task_manager_update_and_poll() {
+        use lean_mcp_core::models::DiagnosticMessage;
+
+        let ctx = AppContext::new();
+        let (task_id, _token) = ctx.task_manager.create_task(2).await;
+
+        ctx.task_manager
+            .update_item(
+                &task_id,
+                0,
+                ItemStatus::Completed {
+                    result: AttemptResult {
+                        snippet: "simp".to_string(),
+                        goals: vec!["no goals".to_string()],
+                        diagnostics: Vec::new(),
+                        timed_out: false,
+                    },
+                },
+            )
+            .await;
+
+        let snap = ctx.task_manager.get_task(&task_id).await.unwrap();
+        assert_eq!(snap.completed_count, 1);
+        assert_eq!(snap.status, TaskStatus::Running);
+
+        ctx.task_manager
+            .update_item(
+                &task_id,
+                1,
+                ItemStatus::Completed {
+                    result: AttemptResult {
+                        snippet: "ring".to_string(),
+                        goals: Vec::new(),
+                        diagnostics: vec![DiagnosticMessage {
+                            severity: "error".to_string(),
+                            message: "tactic 'ring' failed".to_string(),
+                            line: 1,
+                            column: 1,
+                        }],
+                        timed_out: false,
+                    },
+                },
+            )
+            .await;
+
+        let snap = ctx.task_manager.get_task(&task_id).await.unwrap();
+        assert_eq!(snap.completed_count, 2);
+        assert_eq!(snap.status, TaskStatus::Completed);
     }
 }

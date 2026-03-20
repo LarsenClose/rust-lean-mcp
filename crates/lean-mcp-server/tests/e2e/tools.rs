@@ -17,6 +17,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "lean_declaration_file",
     "lean_references",
     "lean_multi_attempt",
+    "lean_multi_attempt_async",
     "lean_run_code",
     "lean_verify",
     "lean_local_search",
