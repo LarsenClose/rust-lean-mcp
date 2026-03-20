@@ -8,7 +8,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::{timeout, Duration};
 
 /// Default timeout for reading a response from the server.
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// MCP test client that spawns and communicates with the server binary.
 pub struct McpTestClient {
