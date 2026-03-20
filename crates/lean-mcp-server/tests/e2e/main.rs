@@ -9,4 +9,5 @@ mod errors;
 mod integration;
 mod protocol;
 mod shutdown;
+mod stress;
 mod tools;
