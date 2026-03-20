@@ -140,6 +140,10 @@ pub struct MultiAttemptParams {
     pub snippets: Vec<String>,
     #[schemars(description = "Column (1-indexed). Omit to target the tactic line")]
     pub column: Option<u32>,
+    #[schemars(
+        description = "When true, test each snippet via independent temp files (no file mutation, concurrent execution). Omit or false for default REPL/LSP path"
+    )]
+    pub parallel: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -736,6 +740,7 @@ impl AppContext {
             params.line,
             &params.snippets,
             params.column,
+            params.parallel,
         )
         .await
         .map(|r| Self::to_json(&r))
