@@ -2010,7 +2010,8 @@ mod tests {
         let snippets = vec!["simp".to_string()];
         // This would fail with "File not open" before the fix
         let result =
-            handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets).await;
+            handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets, None)
+                .await;
 
         // Must succeed (not error with "File not open")
         let result =
@@ -2197,9 +2198,10 @@ mod tests {
         };
 
         let snippets = vec!["simp".to_string()];
-        let err = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
-            .await
-            .unwrap_err();
+        let err =
+            handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets, None)
+                .await
+                .unwrap_err();
 
         match err {
             LeanToolError::LspError {
