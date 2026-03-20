@@ -362,6 +362,133 @@ async fn lsp_path(
 }
 
 // ---------------------------------------------------------------------------
+// Warm LSP single-snippet helper
+// ---------------------------------------------------------------------------
+
+/// Run a single snippet against the warm LSP using edit-and-restore.
+///
+/// This is the per-snippet body extracted from [`lsp_path`]. It:
+/// 1. Applies the snippet edit at `target_col` on `line`
+/// 2. Gets diagnostics and goals
+/// 3. Restores the original content
+///
+/// `line` is 1-indexed. `target_col` is 0-indexed.
+///
+/// On any error, returns an [`AttemptResult`] with the error captured as a
+/// diagnostic rather than propagating. This ensures the caller always gets
+/// a result to post to TaskManager.
+pub async fn run_one_snippet_warm(
+    client: &dyn LspClient,
+    file_path: &str,
+    original_content: &str,
+    line: u32,
+    target_col: u32,
+    snippet: &str,
+    timeout_secs: Option<f64>,
+) -> AttemptResult {
+    let lines: Vec<&str> = original_content.lines().collect();
+    let line_text = if (line as usize) <= lines.len() && line > 0 {
+        lines[(line - 1) as usize]
+    } else {
+        ""
+    };
+
+    let lsp_work = async {
+        let (snippet_str, change, goal_line, goal_column) =
+            prepare_edit(line_text, target_col, snippet, lines.len(), line);
+
+        // Apply the edit
+        client
+            .update_file(file_path, vec![change])
+            .await
+            .map_err(|e| LeanToolError::LspError {
+                operation: "update_file".into(),
+                message: e.to_string(),
+            })?;
+
+        // Get diagnostics
+        let raw_diags = client
+            .get_diagnostics(file_path, None, None, Some(15.0))
+            .await
+            .map_err(|e| LeanToolError::LspError {
+                operation: "get_diagnostics".into(),
+                message: e.to_string(),
+            })?;
+
+        let all_diags = raw_diags
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let filtered = filter_diagnostics_by_line_range(&all_diags, line - 1, goal_line);
+        let diagnostics = to_diagnostic_messages(&filtered);
+
+        // Get goals
+        let goal_result = client
+            .get_goal(file_path, goal_line, goal_column)
+            .await
+            .map_err(|e| LeanToolError::LspError {
+                operation: "get_goal".into(),
+                message: e.to_string(),
+            })?;
+
+        let goals = extract_goals_list(goal_result.as_ref());
+
+        Ok::<AttemptResult, LeanToolError>(AttemptResult {
+            snippet: snippet_str,
+            goals,
+            diagnostics,
+            timed_out: false,
+        })
+    };
+
+    // Apply per-snippet timeout if configured
+    let result: Result<AttemptResult, LeanToolError> = if let Some(secs) = timeout_secs {
+        let snippet_str = snippet.trim_end_matches('\n');
+        match tokio::time::timeout(std::time::Duration::from_secs_f64(secs), lsp_work).await {
+            Ok(r) => r,
+            Err(_) => Ok(AttemptResult {
+                snippet: snippet_str.to_string(),
+                goals: Vec::new(),
+                diagnostics: vec![DiagnosticMessage {
+                    severity: "warning".to_string(),
+                    message: format!("Tactic timed out after {secs}s"),
+                    line: 0,
+                    column: 0,
+                }],
+                timed_out: true,
+            }),
+        }
+    } else {
+        lsp_work.await
+    };
+
+    // Always restore original content after this snippet
+    let _ = client
+        .update_file_content(file_path, original_content)
+        .await;
+
+    match result {
+        Ok(r) => r,
+        Err(e) => {
+            let snippet_str = snippet.trim_end_matches('\n');
+            AttemptResult {
+                snippet: snippet_str.to_string(),
+                goals: Vec::new(),
+                diagnostics: vec![DiagnosticMessage {
+                    severity: "error".to_string(),
+                    message: e.to_string(),
+                    line: 0,
+                    column: 0,
+                }],
+                timed_out: false,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parallel path (run_code semantics)
 // ---------------------------------------------------------------------------
 
@@ -2666,6 +2793,293 @@ mod tests {
         assert!(
             !json_val.as_object().unwrap().contains_key("timed_out"),
             "timed_out=false should be omitted from serialized JSON"
+        );
+    }
+
+    // ========================================================================
+    // run_one_snippet_warm tests (Closes #100)
+    // ========================================================================
+
+    // ---- run_one_snippet_warm: returns goals ----
+
+    #[tokio::test]
+    async fn run_one_snippet_warm_returns_goals() {
+        let client = MockMultiAttemptClient::new("theorem foo : True := by\n  sorry").with_goal(
+            1,
+            6,
+            Some(json!({"goals": ["|- True"]})),
+        );
+
+        let result = run_one_snippet_warm(
+            &client,
+            "Main.lean",
+            "theorem foo : True := by\n  sorry",
+            2, // line (1-indexed)
+            2, // target_col (0-indexed: first non-ws on "  sorry")
+            "simp",
+            None,
+        )
+        .await;
+
+        assert_eq!(result.snippet, "simp");
+        assert_eq!(result.goals, vec!["|- True"]);
+        assert!(result.diagnostics.is_empty());
+        assert!(!result.timed_out);
+    }
+
+    // ---- run_one_snippet_warm: restores original content ----
+
+    #[tokio::test]
+    async fn run_one_snippet_warm_restores_content() {
+        let original = "theorem foo : True := by\n  sorry";
+        let client = MockMultiAttemptClient::new(original);
+
+        let _ = run_one_snippet_warm(&client, "Main.lean", original, 2, 2, "simp", None).await;
+
+        let restored = client.current_content.lock().unwrap().clone();
+        assert_eq!(restored, original, "original content must be restored");
+    }
+
+    // ---- run_one_snippet_warm: timeout produces timed_out result ----
+
+    #[tokio::test]
+    async fn run_one_snippet_warm_timeout() {
+        let client = MockTimeoutClient::new(
+            PathBuf::from("/test/project"),
+            "theorem foo : True := by\n  sorry",
+        )
+        .with_diagnostics_delay(std::time::Duration::from_secs(5));
+
+        let result = run_one_snippet_warm(
+            &client,
+            "Main.lean",
+            "theorem foo : True := by\n  sorry",
+            2,
+            2,
+            "exact?",
+            Some(0.1), // 100ms timeout, diagnostics takes 5s
+        )
+        .await;
+
+        assert!(result.timed_out, "snippet should be marked timed_out");
+        assert!(result.goals.is_empty());
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].severity, "warning");
+        assert!(result.diagnostics[0].message.contains("timed out"));
+        assert_eq!(result.snippet, "exact?");
+    }
+
+    // ---- run_one_snippet_warm: error returns diagnostic (not panic) ----
+
+    /// Mock client where update_file fails.
+    struct MockUpdateFileErrorClient {
+        project: PathBuf,
+        current_content: Mutex<String>,
+    }
+
+    impl MockUpdateFileErrorClient {
+        fn new() -> Self {
+            Self {
+                project: PathBuf::from("/test/project"),
+                current_content: Mutex::new(String::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LspClient for MockUpdateFileErrorClient {
+        fn project_path(&self) -> &Path {
+            &self.project
+        }
+        async fn open_file(&self, _p: &str) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn open_file_force(
+            &self,
+            _p: &str,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn get_file_content(
+            &self,
+            _p: &str,
+        ) -> Result<String, lean_lsp_client::client::LspClientError> {
+            Ok("theorem foo : True := by\n  sorry".to_string())
+        }
+        async fn update_file(
+            &self,
+            _p: &str,
+            _c: Vec<Value>,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Err(lean_lsp_client::client::LspClientError::FileNotOpen(
+                "update_file failed".to_string(),
+            ))
+        }
+        async fn update_file_content(
+            &self,
+            _p: &str,
+            content: &str,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            *self.current_content.lock().unwrap() = content.to_string();
+            Ok(())
+        }
+        async fn close_files(
+            &self,
+            _p: &[String],
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn get_diagnostics(
+            &self,
+            _p: &str,
+            _sl: Option<u32>,
+            _el: Option<u32>,
+            _t: Option<f64>,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({"diagnostics": [], "success": true}))
+        }
+        async fn get_interactive_diagnostics(
+            &self,
+            _p: &str,
+            _sl: Option<u32>,
+            _el: Option<u32>,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_goal(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_term_goal(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_hover(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_completions(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_declarations(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_references(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+            _d: bool,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_document_symbols(
+            &self,
+            _p: &str,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_code_actions(
+            &self,
+            _p: &str,
+            _sl: u32,
+            _sc: u32,
+            _el: u32,
+            _ec: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_code_action_resolve(
+            &self,
+            _a: Value,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({}))
+        }
+        async fn get_widgets(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_widget_source(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+            _h: &str,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({}))
+        }
+        async fn shutdown(&self) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_one_snippet_warm_error_returns_diagnostic() {
+        let client = MockUpdateFileErrorClient::new();
+
+        let result = run_one_snippet_warm(
+            &client,
+            "Main.lean",
+            "theorem foo : True := by\n  sorry",
+            2,
+            2,
+            "simp",
+            None,
+        )
+        .await;
+
+        // Should not panic; error captured as diagnostic
+        assert_eq!(result.snippet, "simp");
+        assert!(result.goals.is_empty());
+        assert!(!result.diagnostics.is_empty());
+        assert_eq!(result.diagnostics[0].severity, "error");
+        assert!(
+            result.diagnostics[0].message.contains("update_file"),
+            "error message should mention the failing operation: {}",
+            result.diagnostics[0].message
+        );
+        assert!(!result.timed_out);
+    }
+
+    // ---- run_one_snippet_warm: content restored even on error ----
+
+    #[tokio::test]
+    async fn run_one_snippet_warm_restores_on_error() {
+        let original = "theorem foo : True := by\n  sorry";
+        let client = MockUpdateFileErrorClient::new();
+
+        let _ = run_one_snippet_warm(&client, "Main.lean", original, 2, 2, "simp", None).await;
+
+        let restored = client.current_content.lock().unwrap().clone();
+        assert_eq!(
+            restored, original,
+            "original content must be restored even on error"
         );
     }
 }
