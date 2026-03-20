@@ -1,0 +1,86 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same PR
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Benchmark Regression Check
+    runs-on: ubuntu-latest
+    # Informational only — CI runner noise makes benchmarks unreliable as a gate
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # Need full history for checking out main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install critcmp
+        run: cargo install critcmp --locked
+
+      - name: Run benchmarks on PR branch
+        run: cargo bench --bench core_bench --bench server_bench -- --save-baseline pr
+
+      - name: Run benchmarks on main branch
+        run: |
+          git stash --include-untracked || true
+          git checkout main
+          cargo bench --bench core_bench --bench server_bench -- --save-baseline main
+          git checkout -
+          git stash pop || true
+
+      - name: Compare benchmarks
+        run: |
+          # Full comparison for the step summary
+          echo "## Benchmark Comparison (main vs PR)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          critcmp main pr >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # Run critcmp and capture output for regression detection
+          critcmp main pr 2>&1 | tee /tmp/bench_comparison.txt
+
+          # critcmp output format shows percentage change like "+12.34%" or "-5.67%"
+          # Extract percentage changes and check if any positive change exceeds 10%
+          # Positive % means the PR branch is slower (higher time = regression)
+          if awk '
+            /[0-9]+\.[0-9]+%/ {
+              for (i = 1; i <= NF; i++) {
+                if (match($i, /^\+([0-9]+\.[0-9]+)%$/, m)) {
+                  val = m[1] + 0
+                  if (val > 10.0) {
+                    found = 1
+                  }
+                }
+              }
+            }
+            END { exit !found }
+          ' /tmp/bench_comparison.txt; then
+            echo ""
+            echo "::warning::Benchmark regression detected (>10% slower on PR branch)"
+            echo "### Benchmark Regression Detected (>10%)" >> "$GITHUB_STEP_SUMMARY"
+            echo ""
+            echo "Results above are informational — CI runners have noisy measurements."
+          else
+            echo ""
+            echo "No significant benchmark regressions detected."
+            echo "### No Benchmark Regressions" >> "$GITHUB_STEP_SUMMARY"
+          fi
