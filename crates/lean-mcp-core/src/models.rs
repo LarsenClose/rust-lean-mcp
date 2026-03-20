@@ -270,6 +270,13 @@ pub struct DiagnosticsResult {
     /// File paths of dependencies that failed to build.
     #[serde(default)]
     pub failed_dependencies: Vec<String>,
+    /// Warning when source files are newer than their cached oleans.
+    /// The LSP uses oleans for imports, so diagnostics may be unreliable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_olean_warning: Option<String>,
+    /// Relative paths of source files with stale oleans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_files: Vec<String>,
 }
 
 /// Wrapper for completions list.
@@ -666,12 +673,51 @@ mod tests {
                 column: 5,
             }],
             failed_dependencies: vec!["Mathlib.Tactic".into()],
+            stale_olean_warning: None,
+            stale_files: Vec::new(),
         };
         let json = serde_json::to_string(&dr).unwrap();
         let dr2: DiagnosticsResult = serde_json::from_str(&json).unwrap();
         assert!(!dr2.success);
         assert_eq!(dr2.items.len(), 1);
         assert_eq!(dr2.failed_dependencies, vec!["Mathlib.Tactic"]);
+        assert!(dr2.stale_olean_warning.is_none());
+        assert!(dr2.stale_files.is_empty());
+    }
+
+    #[test]
+    fn round_trip_diagnostics_result_with_stale_oleans() {
+        let dr = DiagnosticsResult {
+            success: true,
+            items: vec![],
+            failed_dependencies: vec![],
+            stale_olean_warning: Some(
+                "WARNING: 2 source file(s) are newer than their oleans".into(),
+            ),
+            stale_files: vec!["Foo/Bar.lean".into(), "Main.lean".into()],
+        };
+        let json = serde_json::to_string(&dr).unwrap();
+        let dr2: DiagnosticsResult = serde_json::from_str(&json).unwrap();
+        assert!(dr2.success);
+        assert_eq!(
+            dr2.stale_olean_warning.as_deref(),
+            Some("WARNING: 2 source file(s) are newer than their oleans")
+        );
+        assert_eq!(dr2.stale_files, vec!["Foo/Bar.lean", "Main.lean"]);
+    }
+
+    #[test]
+    fn diagnostics_result_stale_fields_omitted_when_empty() {
+        let dr = DiagnosticsResult {
+            success: true,
+            items: vec![],
+            failed_dependencies: vec![],
+            stale_olean_warning: None,
+            stale_files: Vec::new(),
+        };
+        let v: Value = serde_json::to_value(&dr).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("stale_olean_warning"));
+        assert!(!v.as_object().unwrap().contains_key("stale_files"));
     }
 
     #[test]

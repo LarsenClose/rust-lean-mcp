@@ -648,8 +648,10 @@ impl AppContext {
         Parameters(params): Parameters<DiagnosticParams>,
     ) -> Result<String, String> {
         let client = self.client_for_file(&params.file_path).await?;
+        let project_path = self.resolve_project_path(Some(&params.file_path))?;
         tools::diagnostics::handle_diagnostics(
             client.as_ref(),
+            &project_path,
             &params.file_path,
             params.start_line,
             params.end_line,
