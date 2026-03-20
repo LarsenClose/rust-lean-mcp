@@ -165,6 +165,10 @@ pub struct MultiAttemptAsyncParams {
     pub column: Option<u32>,
     #[schemars(description = "Max seconds per snippet (returns 'timeout' for slow tactics)")]
     pub timeout_per_snippet: Option<f64>,
+    #[schemars(
+        description = "Use independent temp files per snippet (slow but isolated). Default: false (uses warm LSP)"
+    )]
+    pub isolated: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -865,17 +869,13 @@ impl AppContext {
 
     #[tool(
         name = "lean_multi_attempt_async",
-        description = "Submit background tactic attempts. Returns task_id immediately. Poll with lean_task_result."
+        description = "Submit background tactic attempts. Returns task_id immediately. Poll with lean_task_result. Uses warm LSP by default (fast). Set isolated=true for independent temp files."
     )]
     async fn lean_multi_attempt_async(
         &self,
         Parameters(params): Parameters<MultiAttemptAsyncParams>,
     ) -> Result<String, String> {
-        // column is accepted for API compatibility but unused in the async/parallel path
-        let _ = params.column;
-
         let client = self.client_for_file(&params.file_path).await?;
-        let project_path = client.project_path().to_path_buf();
 
         // Ensure file is open before reading content (#90)
         client
@@ -897,46 +897,96 @@ impl AppContext {
             ));
         }
 
-        let base_code = lines[..params.line as usize - 1].join("\n");
-        let target_line = lines[(params.line - 1) as usize];
-        let indent_len = target_line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-        let indent = target_line[..indent_len].to_string();
-
         // Create task
         let (task_id, cancel_token) = self.task_manager.create_task(params.snippets.len()).await;
 
-        // Spawn each snippet as an independent background task
+        let isolated = params.isolated.unwrap_or(false);
         let timeout = params.timeout_per_snippet;
-        for (i, snippet) in params.snippets.iter().enumerate() {
-            let client = client.clone();
-            let project_path = project_path.clone();
-            let base_code = base_code.clone();
-            let indent = indent.clone();
+
+        if isolated {
+            // Isolated path: spawn each snippet as an independent temp-file task
+            let project_path = client.project_path().to_path_buf();
+            let base_code = lines[..params.line as usize - 1].join("\n");
+            let target_line = lines[(params.line - 1) as usize];
+            let indent_len = target_line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+            let indent = target_line[..indent_len].to_string();
+
+            for (i, snippet) in params.snippets.iter().enumerate() {
+                let client = client.clone();
+                let project_path = project_path.clone();
+                let base_code = base_code.clone();
+                let indent = indent.clone();
+                let task_manager = self.task_manager.clone();
+                let task_id = task_id.clone();
+                let snippet = snippet.clone();
+                let cancel_token = cancel_token.clone();
+
+                tokio::spawn(async move {
+                    use lean_mcp_core::task_manager::ItemStatus;
+
+                    if cancel_token.is_cancelled() {
+                        return;
+                    }
+
+                    let result = crate::tools::multi_attempt::run_snippet_isolated(
+                        client.as_ref(),
+                        &project_path,
+                        &snippet,
+                        &base_code,
+                        &indent,
+                        timeout,
+                    )
+                    .await;
+
+                    task_manager
+                        .update_item(&task_id, i, ItemStatus::Completed { result })
+                        .await;
+                });
+            }
+        } else {
+            // Default warm LSP path: single background task, sequential edit-and-restore
+            let file_path = params.file_path.clone();
+            let original_content = content.clone();
+            let line = params.line;
+            let snippets = params.snippets.clone();
             let task_manager = self.task_manager.clone();
-            let task_id = task_id.clone();
-            let snippet = snippet.clone();
-            let cancel_token = cancel_token.clone();
+            let task_id_clone = task_id.clone();
+
+            let line_text = lines[(line - 1) as usize];
+            let target_col = match params.column {
+                Some(c) if c > 0 => c - 1, // 1-indexed to 0-indexed
+                _ => line_text.find(|c: char| !c.is_whitespace()).unwrap_or(0) as u32,
+            };
 
             tokio::spawn(async move {
                 use lean_mcp_core::task_manager::ItemStatus;
 
-                if cancel_token.is_cancelled() {
-                    return;
+                for (i, snippet) in snippets.iter().enumerate() {
+                    if cancel_token.is_cancelled() {
+                        break;
+                    }
+
+                    let result = crate::tools::multi_attempt::run_one_snippet_warm(
+                        client.as_ref(),
+                        &file_path,
+                        &original_content,
+                        line,
+                        target_col,
+                        snippet,
+                        timeout,
+                    )
+                    .await;
+
+                    task_manager
+                        .update_item(&task_id_clone, i, ItemStatus::Completed { result })
+                        .await;
                 }
 
-                let result = crate::tools::multi_attempt::run_snippet_isolated(
-                    client.as_ref(),
-                    &project_path,
-                    &snippet,
-                    &base_code,
-                    &indent,
-                    timeout,
-                )
-                .await;
-
-                task_manager
-                    .update_item(&task_id, i, ItemStatus::Completed { result })
+                // Final restore + force reopen
+                let _ = client
+                    .update_file_content(&file_path, &original_content)
                     .await;
+                let _ = client.open_file_force(&file_path).await;
             });
         }
 
