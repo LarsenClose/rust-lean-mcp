@@ -3,12 +3,15 @@
 //! Tries multiple tactic snippets at a given file position without permanently
 //! modifying the file. Returns goal state and diagnostics for each snippet.
 //!
-//! Two paths:
+//! Three paths:
 //! - **REPL fast path**: when REPL is available, no column is specified, and
 //!   no snippet contains newlines. Uses `Repl::run_snippets()`.
 //! - **LSP fallback**: for each snippet, temporarily inserts the tactic text
 //!   via incremental file edits, collects diagnostics + goals, then restores
 //!   the original file content.
+//! - **Parallel path** (`parallel=true`): each snippet is tested via an
+//!   independent `run_code`-style temp file. No file mutation, naturally
+//!   concurrent via `futures::future::join_all`.
 
 use lean_lsp_client::client::LspClient;
 use lean_lsp_client::types::severity;
@@ -17,6 +20,8 @@ use lean_mcp_core::models::{AttemptResult, DiagnosticMessage, MultiAttemptResult
 use lean_mcp_core::repl::Repl;
 use lean_mcp_core::utils::extract_goals_list;
 use serde_json::{json, Value};
+use std::path::Path;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -355,14 +360,188 @@ async fn lsp_path(
 }
 
 // ---------------------------------------------------------------------------
+// Parallel path (run_code semantics)
+// ---------------------------------------------------------------------------
+
+/// Run a single snippet via an independent temp file, returning its result.
+///
+/// The temp file contains `base_code + snippet + "\n  sorry"`, which gives the
+/// LSP enough context to check the tactic. Diagnostics are collected and
+/// the file is always cleaned up.
+async fn run_snippet_isolated(
+    client: &dyn LspClient,
+    project_path: &Path,
+    snippet: &str,
+    base_code: &str,
+) -> AttemptResult {
+    let snippet_str = snippet.trim_end_matches('\n');
+    let code = if base_code.is_empty() {
+        format!("{snippet_str}\n  sorry")
+    } else {
+        format!("{base_code}\n{snippet_str}\n  sorry")
+    };
+
+    let base_line_count = base_code.lines().count();
+
+    let rel_path = format!("_mcp_attempt_{}.lean", Uuid::new_v4().as_simple());
+    let abs_path = project_path.join(&rel_path);
+
+    // Write temp file
+    if let Err(e) = std::fs::write(&abs_path, &code) {
+        return AttemptResult {
+            snippet: snippet_str.to_string(),
+            goals: Vec::new(),
+            diagnostics: vec![DiagnosticMessage {
+                severity: "error".to_string(),
+                message: format!("Failed to write temp file: {e}"),
+                line: 0,
+                column: 0,
+            }],
+        };
+    }
+
+    let result: Result<AttemptResult, LeanToolError> = async {
+        // Open in LSP
+        client
+            .open_file(&rel_path)
+            .await
+            .map_err(|e| LeanToolError::LspError {
+                operation: "open_file".into(),
+                message: e.to_string(),
+            })?;
+
+        // Get diagnostics
+        let raw = client
+            .get_diagnostics(&rel_path, None, None, Some(15.0))
+            .await
+            .map_err(|e| LeanToolError::LspError {
+                operation: "get_diagnostics".into(),
+                message: e.to_string(),
+            })?;
+
+        let all_diags = raw
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        // Filter diagnostics to only those from the snippet region (after base_code).
+        // The snippet starts at base_line_count (0-indexed).
+        let snippet_start_line = base_line_count as u32;
+        let snippet_line_count = snippet_str.lines().count().max(1) as u32;
+        // Include the sorry line too (snippet_start_line + snippet_line_count)
+        let snippet_end_line = snippet_start_line + snippet_line_count;
+
+        let filtered =
+            filter_diagnostics_by_line_range(&all_diags, snippet_start_line, snippet_end_line);
+        let diagnostics = to_diagnostic_messages(&filtered);
+
+        // Get goal state at the end of the snippet (before sorry)
+        // The snippet's last line is at snippet_start_line + snippet_line_count - 1
+        let goal_line = snippet_start_line + snippet_line_count - 1;
+        let last_snippet_line = snippet_str.lines().last().unwrap_or("");
+        let goal_column = last_snippet_line.len() as u32;
+
+        let goal_result = client
+            .get_goal(&rel_path, goal_line, goal_column)
+            .await
+            .map_err(|e| LeanToolError::LspError {
+                operation: "get_goal".into(),
+                message: e.to_string(),
+            })?;
+
+        let goals = extract_goals_list(goal_result.as_ref());
+
+        Ok(AttemptResult {
+            snippet: snippet_str.to_string(),
+            goals,
+            diagnostics,
+        })
+    }
+    .await;
+
+    // Always clean up
+    let _ = client.close_files(&[rel_path]).await;
+    let _ = std::fs::remove_file(&abs_path);
+
+    match result {
+        Ok(r) => r,
+        Err(e) => AttemptResult {
+            snippet: snippet_str.to_string(),
+            goals: Vec::new(),
+            diagnostics: vec![DiagnosticMessage {
+                severity: "error".to_string(),
+                message: e.to_string(),
+                line: 0,
+                column: 0,
+            }],
+        },
+    }
+}
+
+/// Parallel multi-attempt: tests each tactic via independent run_code calls.
+///
+/// Each tactic gets the file content up to the target line + the tactic appended
+/// to an independent temp file. No file mutation, no need to restore state,
+/// naturally parallelizable via `futures::future::join_all`.
+///
+/// `line` is **1-indexed** (matching the MCP tool interface).
+pub async fn handle_multi_attempt_parallel(
+    client: &dyn LspClient,
+    project_path: &Path,
+    file_path: &str,
+    line: u32,
+    snippets: &[String],
+) -> Result<MultiAttemptResult, LeanToolError> {
+    if snippets.is_empty() {
+        return Ok(MultiAttemptResult { items: Vec::new() });
+    }
+
+    // 1. Read file content to extract base code
+    let content =
+        client
+            .get_file_content(file_path)
+            .await
+            .map_err(|e| LeanToolError::LspError {
+                operation: "get_file_content".into(),
+                message: e.to_string(),
+            })?;
+
+    let lines: Vec<&str> = content.lines().collect();
+    if line == 0 || line as usize > lines.len() {
+        return Err(LeanToolError::LineOutOfRange {
+            line,
+            total: lines.len(),
+        });
+    }
+
+    // 2. Extract code up to target line (imports + context before the tactic)
+    let base_code = lines[..line as usize - 1].join("\n");
+
+    // 3. Fire all run_code calls concurrently
+    let futures: Vec<_> = snippets
+        .iter()
+        .map(|snippet| run_snippet_isolated(client, project_path, snippet, &base_code))
+        .collect();
+
+    let items = futures::future::join_all(futures).await;
+
+    Ok(MultiAttemptResult { items })
+}
+
+// ---------------------------------------------------------------------------
 // Public handler
 // ---------------------------------------------------------------------------
 
 /// Handle a `lean_multi_attempt` tool call.
 ///
 /// Tries multiple tactic snippets at the given position without permanently
-/// modifying the file. Uses the REPL fast path when available, falling back
-/// to LSP file edits.
+/// modifying the file.
+///
+/// When `parallel` is `Some(true)`, uses independent temp files for each
+/// snippet (run_code semantics), enabling true concurrent execution.
+/// Otherwise, uses the REPL fast path when available, falling back to
+/// sequential LSP file edits.
 ///
 /// `line` and `column` are **1-indexed** (matching the MCP tool interface).
 pub async fn handle_multi_attempt(
@@ -372,7 +551,15 @@ pub async fn handle_multi_attempt(
     line: u32,
     snippets: &[String],
     column: Option<u32>,
+    parallel: Option<bool>,
 ) -> Result<MultiAttemptResult, LeanToolError> {
+    // Parallel path: use run_code semantics with independent temp files
+    if parallel == Some(true) {
+        let project_path = client.project_path().to_path_buf();
+        return handle_multi_attempt_parallel(client, &project_path, file_path, line, snippets)
+            .await;
+    }
+
     // Try REPL fast path first
     if let Some(result) = try_repl_path(client, repl, file_path, line, snippets, column).await? {
         return Ok(result);
@@ -600,13 +787,11 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_single_snippet_returns_goals() {
-        // "  sorry" on line 2 (1-indexed). First non-ws at col 2 (0-indexed).
-        // Snippet "simp" → single line → goal at (1, 2+4=6)
         let client = MockMultiAttemptClient::new("theorem foo : True := by\n  sorry\n  done")
             .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
-        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None)
+        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None, None)
             .await
             .unwrap();
 
@@ -627,7 +812,7 @@ mod tests {
         );
 
         let snippets = vec!["simp".to_string(), "trivial".to_string()];
-        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None)
+        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None, None)
             .await
             .unwrap();
 
@@ -640,8 +825,6 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_explicit_column() {
-        // col=5 (1-indexed) → target_col=4 (0-indexed)
-        // "simp" at col 4 → goal at (1, 4+4=8)
         let client = MockMultiAttemptClient::new("theorem foo : True := by\n  sorry").with_goal(
             1,
             8,
@@ -649,7 +832,7 @@ mod tests {
         );
 
         let snippets = vec!["simp".to_string()];
-        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, Some(5))
+        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, Some(5), None)
             .await
             .unwrap();
 
@@ -673,7 +856,7 @@ mod tests {
             .with_goal(1, 6, None);
 
         let snippets = vec!["bad_tactic".to_string()];
-        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None)
+        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None, None)
             .await
             .unwrap();
 
@@ -698,11 +881,10 @@ mod tests {
             .with_goal(2, 6, None);
 
         let snippets = vec!["simp".to_string()];
-        let result = handle_multi_attempt(&client, None, "Main.lean", 3, &snippets, None)
+        let result = handle_multi_attempt(&client, None, "Main.lean", 3, &snippets, None, None)
             .await
             .unwrap();
 
-        // The diagnostic on line 0 should be filtered out (target is line 2)
         assert!(result.items[0].diagnostics.is_empty());
     }
 
@@ -713,7 +895,7 @@ mod tests {
         let client = MockMultiAttemptClient::new("theorem foo : True := by\n  sorry");
 
         let snippets = vec!["simp".to_string()];
-        let _ = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None).await;
+        let _ = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None, None).await;
 
         assert!(*client.force_reopen_called.lock().unwrap());
     }
@@ -726,7 +908,7 @@ mod tests {
         let client = MockMultiAttemptClient::new(original);
 
         let snippets = vec!["simp".to_string()];
-        let _ = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None).await;
+        let _ = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None, None).await;
 
         let restored = client.current_content.lock().unwrap().clone();
         assert_eq!(restored, original);
@@ -739,7 +921,7 @@ mod tests {
         let client = MockMultiAttemptClient::new("one line");
 
         let snippets = vec!["simp".to_string()];
-        let err = handle_multi_attempt(&client, None, "Main.lean", 5, &snippets, None)
+        let err = handle_multi_attempt(&client, None, "Main.lean", 5, &snippets, None, None)
             .await
             .unwrap_err();
 
@@ -759,7 +941,7 @@ mod tests {
         let client = MockMultiAttemptClient::new("short");
 
         let snippets = vec!["simp".to_string()];
-        let err = handle_multi_attempt(&client, None, "Main.lean", 1, &snippets, Some(100))
+        let err = handle_multi_attempt(&client, None, "Main.lean", 1, &snippets, Some(100), None)
             .await
             .unwrap_err();
 
@@ -803,9 +985,8 @@ mod tests {
         let (snippet_str, change, goal_line, goal_col) = prepare_edit("  sorry", 2, "simp", 3, 2);
 
         assert_eq!(snippet_str, "simp");
-        assert_eq!(goal_line, 1); // line 2 (0-indexed = 1)
-        assert_eq!(goal_col, 6); // 2 + len("simp") = 6
-                                 // Verify change has correct range
+        assert_eq!(goal_line, 1);
+        assert_eq!(goal_col, 6);
         assert_eq!(change["range"]["start"]["line"], 1);
         assert_eq!(change["range"]["start"]["character"], 2);
     }
@@ -816,8 +997,8 @@ mod tests {
             prepare_edit("  sorry", 2, "simp\nexact h", 3, 2);
 
         assert_eq!(snippet_str, "simp\nexact h");
-        assert_eq!(goal_line, 2); // line 2 (0-indexed = 1) + 2 lines - 1
-        assert_eq!(goal_col, 9); // len("  exact h") = 9 (indent "  " + "exact h")
+        assert_eq!(goal_line, 2);
+        assert_eq!(goal_col, 9);
     }
 
     #[test]
@@ -879,13 +1060,11 @@ mod tests {
             Some(json!({"goals": []})),
         );
 
-        // Even though we could pass a repl, column is specified → LSP path
         let snippets = vec!["simp".to_string()];
-        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, Some(3))
+        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, Some(3), None)
             .await
             .unwrap();
 
-        // Should still work via LSP
         assert_eq!(result.items.len(), 1);
     }
 
@@ -897,7 +1076,7 @@ mod tests {
             MockMultiAttemptClient::new("theorem foo : True := by\n  sorry").with_goal(1, 6, None);
 
         let snippets = vec!["simp\nexact h".to_string()];
-        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None)
+        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None, None)
             .await
             .unwrap();
 
@@ -911,10 +1090,468 @@ mod tests {
         let client = MockMultiAttemptClient::new("theorem foo : True := by\n  sorry");
 
         let snippets: Vec<String> = vec![];
-        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None)
+        let result = handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None, None)
             .await
             .unwrap();
 
         assert!(result.items.is_empty());
+    }
+
+    // ========================================================================
+    // Parallel path tests (8 tests)
+    // ========================================================================
+
+    /// Mock LSP client for parallel multi-attempt tests.
+    ///
+    /// Uses a real temp dir for project_path so temp files can be written/cleaned.
+    struct MockParallelClient {
+        project: PathBuf,
+        content: String,
+        diagnostics_response: Value,
+        goal_responses: Vec<((u32, u32), Option<Value>)>,
+        close_called: Mutex<Vec<String>>,
+    }
+
+    impl MockParallelClient {
+        fn new(project: PathBuf, content: &str) -> Self {
+            Self {
+                project,
+                content: content.to_string(),
+                diagnostics_response: json!({
+                    "diagnostics": [],
+                    "success": true
+                }),
+                goal_responses: Vec::new(),
+                close_called: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_diagnostics(mut self, diags: Vec<Value>) -> Self {
+            self.diagnostics_response = json!({
+                "diagnostics": diags,
+                "success": true
+            });
+            self
+        }
+
+        fn with_goal(mut self, line: u32, col: u32, response: Option<Value>) -> Self {
+            self.goal_responses.push(((line, col), response));
+            self
+        }
+    }
+
+    #[async_trait]
+    impl LspClient for MockParallelClient {
+        fn project_path(&self) -> &Path {
+            &self.project
+        }
+        async fn open_file(&self, _p: &str) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn open_file_force(
+            &self,
+            _p: &str,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn get_file_content(
+            &self,
+            _p: &str,
+        ) -> Result<String, lean_lsp_client::client::LspClientError> {
+            Ok(self.content.clone())
+        }
+        async fn update_file(
+            &self,
+            _p: &str,
+            _c: Vec<Value>,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn update_file_content(
+            &self,
+            _p: &str,
+            _c: &str,
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+        async fn close_files(
+            &self,
+            paths: &[String],
+        ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            self.close_called
+                .lock()
+                .unwrap()
+                .extend(paths.iter().cloned());
+            Ok(())
+        }
+        async fn get_diagnostics(
+            &self,
+            _p: &str,
+            _sl: Option<u32>,
+            _el: Option<u32>,
+            _t: Option<f64>,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(self.diagnostics_response.clone())
+        }
+        async fn get_interactive_diagnostics(
+            &self,
+            _p: &str,
+            _sl: Option<u32>,
+            _el: Option<u32>,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_goal(
+            &self,
+            _p: &str,
+            line: u32,
+            column: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            for ((l, c), resp) in &self.goal_responses {
+                if *l == line && *c == column {
+                    return Ok(resp.clone());
+                }
+            }
+            Ok(None)
+        }
+        async fn get_term_goal(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_hover(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Option<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(None)
+        }
+        async fn get_completions(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_declarations(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_references(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+            _d: bool,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_document_symbols(
+            &self,
+            _p: &str,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_code_actions(
+            &self,
+            _p: &str,
+            _sl: u32,
+            _sc: u32,
+            _el: u32,
+            _ec: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_code_action_resolve(
+            &self,
+            _a: Value,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({}))
+        }
+        async fn get_widgets(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Result<Vec<Value>, lean_lsp_client::client::LspClientError> {
+            Ok(vec![])
+        }
+        async fn get_widget_source(
+            &self,
+            _p: &str,
+            _l: u32,
+            _c: u32,
+            _h: &str,
+        ) -> Result<Value, lean_lsp_client::client::LspClientError> {
+            Ok(json!({}))
+        }
+        async fn shutdown(&self) -> Result<(), lean_lsp_client::client::LspClientError> {
+            Ok(())
+        }
+    }
+
+    // ---- Parallel: single snippet returns results ----
+
+    #[tokio::test]
+    async fn parallel_single_snippet_returns_results() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // goal queried at (1, 4) -- line 1 (0-indexed), col = len("simp") = 4
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        )
+        .with_goal(1, 4, Some(json!({"goals": ["|- True"]})));
+
+        let snippets = vec!["simp".to_string()];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].snippet, "simp");
+        assert_eq!(result.items[0].goals, vec!["|- True"]);
+        assert!(result.items[0].diagnostics.is_empty());
+    }
+
+    // ---- Parallel: multiple snippets all complete ----
+
+    #[tokio::test]
+    async fn parallel_multiple_snippets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        )
+        .with_goal(1, 4, Some(json!({"goals": ["|- True"]})))
+        .with_goal(1, 7, Some(json!({"goals": []})));
+
+        let snippets = vec!["simp".to_string(), "trivial".to_string()];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0].snippet, "simp");
+        assert_eq!(result.items[1].snippet, "trivial");
+    }
+
+    // ---- Parallel: empty snippets returns empty ----
+
+    #[tokio::test]
+    async fn parallel_empty_snippets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        );
+
+        let snippets: Vec<String> = vec![];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap();
+
+        assert!(result.items.is_empty());
+    }
+
+    // ---- Parallel: line out of range ----
+
+    #[tokio::test]
+    async fn parallel_line_out_of_range() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(dir.path().to_path_buf(), "one line");
+
+        let snippets = vec!["simp".to_string()];
+        let err = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 5, &snippets)
+            .await
+            .unwrap_err();
+
+        match err {
+            LeanToolError::LineOutOfRange { line, total } => {
+                assert_eq!(line, 5);
+                assert_eq!(total, 1);
+            }
+            other => panic!("expected LineOutOfRange, got: {other}"),
+        }
+    }
+
+    // ---- Parallel: temp files are cleaned up ----
+
+    #[tokio::test]
+    async fn parallel_temp_files_cleaned_up() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        );
+
+        let snippets = vec!["simp".to_string(), "ring".to_string()];
+        let _ = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap();
+
+        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("_mcp_attempt_"))
+            .collect();
+        assert!(remaining.is_empty(), "temp files were not cleaned up");
+    }
+
+    // ---- Parallel: close_files called for each snippet ----
+
+    #[tokio::test]
+    async fn parallel_close_files_called() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        );
+
+        let snippets = vec!["simp".to_string(), "ring".to_string()];
+        let _ = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap();
+
+        let closed = client.close_called.lock().unwrap();
+        assert_eq!(
+            closed.len(),
+            2,
+            "close_files should be called for each snippet"
+        );
+        for path in closed.iter() {
+            assert!(
+                path.starts_with("_mcp_attempt_"),
+                "closed path should be a temp file: {path}"
+            );
+        }
+    }
+
+    // ---- Parallel: diagnostics in snippet range are captured ----
+
+    #[tokio::test]
+    async fn parallel_diagnostics_captured() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        )
+        .with_diagnostics(vec![json!({
+            "range": {
+                "start": {"line": 1, "character": 0},
+                "end": {"line": 1, "character": 10}
+            },
+            "severity": 1,
+            "message": "unknown tactic 'bad'"
+        })]);
+
+        let snippets = vec!["bad".to_string()];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items[0].diagnostics.len(), 1);
+        assert_eq!(result.items[0].diagnostics[0].severity, "error");
+        assert_eq!(
+            result.items[0].diagnostics[0].message,
+            "unknown tactic 'bad'"
+        );
+    }
+
+    // ---- Parallel: diagnostics outside snippet range are filtered ----
+
+    #[tokio::test]
+    async fn parallel_diagnostics_outside_range_filtered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "import Lean\ntheorem foo : True := by\n  sorry",
+        )
+        .with_diagnostics(vec![json!({
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 5}
+            },
+            "severity": 2,
+            "message": "import warning"
+        })]);
+
+        let snippets = vec!["simp".to_string()];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 3, &snippets)
+            .await
+            .unwrap();
+
+        assert!(
+            result.items[0].diagnostics.is_empty(),
+            "diagnostics outside snippet range should be filtered"
+        );
+    }
+
+    // ---- handle_multi_attempt dispatches to parallel when flag set ----
+
+    #[tokio::test]
+    async fn handle_multi_attempt_dispatches_parallel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        )
+        .with_goal(1, 4, Some(json!({"goals": ["|- True"]})));
+
+        let snippets = vec!["simp".to_string()];
+        let result =
+            handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None, Some(true))
+                .await
+                .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].snippet, "simp");
+    }
+
+    // ---- parallel=false uses default (LSP) path ----
+
+    #[tokio::test]
+    async fn handle_multi_attempt_parallel_false_uses_lsp() {
+        let client = MockMultiAttemptClient::new("theorem foo : True := by\n  sorry").with_goal(
+            1,
+            6,
+            Some(json!({"goals": ["|- True"]})),
+        );
+
+        let snippets = vec!["simp".to_string()];
+        let result =
+            handle_multi_attempt(&client, None, "Main.lean", 2, &snippets, None, Some(false))
+                .await
+                .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        // LSP path used -> force reopen should be called
+        assert!(*client.force_reopen_called.lock().unwrap());
+    }
+
+    // ---- Parallel: snippet with trailing newline is trimmed ----
+
+    #[tokio::test]
+    async fn parallel_trailing_newline_trimmed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := by\n  sorry",
+        );
+
+        let snippets = vec!["simp\n".to_string()];
+        let result = handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 2, &snippets)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items[0].snippet, "simp");
     }
 }
