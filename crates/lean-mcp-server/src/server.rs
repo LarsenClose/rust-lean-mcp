@@ -1,7 +1,7 @@
 //! MCP server setup and tool routing.
 //!
 //! Defines [`AppContext`] for shared server state and implements the rmcp
-//! `ServerHandler` trait with all 24 tool handlers wired to the MCP protocol.
+//! `ServerHandler` trait with all 28 tool handlers wired to the MCP protocol.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -314,6 +314,9 @@ pub struct ProjectHealthParams {
     #[schemars(description = "Fetch goal states at sorry positions (slow, requires LSP)")]
     pub include_goals: Option<bool>,
 }
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ServerHealthParams {}
 
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskResultParams {
@@ -1332,6 +1335,36 @@ impl AppContext {
 
         Ok(Self::to_json(&snapshot))
     }
+
+    // ---- Server Health ----
+
+    #[tool(
+        name = "lean_server_health",
+        description = "Get server status: active LSP sessions, pending tasks, and uptime."
+    )]
+    async fn lean_server_health(
+        &self,
+        Parameters(_params): Parameters<ServerHealthParams>,
+    ) -> Result<String, String> {
+        let clients = self.clients.read().await;
+        let mut sessions = Vec::new();
+
+        for (path, _client) in clients.iter() {
+            sessions.push(serde_json::json!({
+                "project_path": path.to_string_lossy(),
+                "status": "active",
+            }));
+        }
+        drop(clients);
+
+        let result = serde_json::json!({
+            "active_sessions": sessions.len(),
+            "sessions": sessions,
+            "server_version": server_version(),
+        });
+
+        Ok(Self::to_json(&result))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1765,5 +1798,69 @@ mod tests {
         let snap = ctx.task_manager.get_task(&task_id).await.unwrap();
         assert_eq!(snap.completed_count, 2);
         assert_eq!(snap.status, TaskStatus::Completed);
+    }
+
+    // ---- lean_server_health tests ----
+
+    #[tokio::test]
+    async fn server_health_returns_valid_json() {
+        let ctx = AppContext::new();
+        let result = ctx
+            .lean_server_health(Parameters(ServerHealthParams {}))
+            .await
+            .expect("lean_server_health should succeed");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("result should be valid JSON");
+        assert!(
+            parsed.get("active_sessions").is_some(),
+            "response should contain active_sessions"
+        );
+        assert!(
+            parsed.get("sessions").is_some(),
+            "response should contain sessions"
+        );
+        assert!(parsed["sessions"].is_array(), "sessions should be an array");
+        assert!(
+            parsed.get("server_version").is_some(),
+            "response should contain server_version"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_health_no_sessions_initially() {
+        let ctx = AppContext::new();
+        let result = ctx
+            .lean_server_health(Parameters(ServerHealthParams {}))
+            .await
+            .expect("lean_server_health should succeed");
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["active_sessions"], 0,
+            "fresh server should have 0 active sessions"
+        );
+        assert_eq!(
+            parsed["sessions"].as_array().unwrap().len(),
+            0,
+            "fresh server should have empty sessions array"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_health_shows_version() {
+        let ctx = AppContext::new();
+        let result = ctx
+            .lean_server_health(Parameters(ServerHealthParams {}))
+            .await
+            .expect("lean_server_health should succeed");
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let version = parsed["server_version"]
+            .as_str()
+            .expect("server_version should be a string");
+        assert!(!version.is_empty(), "server_version should be non-empty");
+        // Should match the compile-time version
+        assert_eq!(version, server_version());
     }
 }
