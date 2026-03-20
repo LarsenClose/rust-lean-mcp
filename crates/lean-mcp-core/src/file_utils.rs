@@ -81,6 +81,29 @@ pub fn infer_project_path(file_path: &str) -> Option<PathBuf> {
     }
 }
 
+/// Detect a Lean project root by walking up from `start`.
+///
+/// Checks for `lakefile.lean`, `lakefile.toml`, and `lean-toolchain` at each level.
+/// Returns the first directory containing any of these markers.
+pub fn detect_lean_project(start: &Path) -> Option<PathBuf> {
+    let mut dir = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+    loop {
+        if dir.join("lakefile.lean").exists()
+            || dir.join("lakefile.toml").exists()
+            || dir.join("lean-toolchain").is_file()
+        {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Check whether `path` contains a `lean-toolchain` file.
 pub fn valid_lean_project_path(path: &Path) -> bool {
     path.join("lean-toolchain").is_file()
@@ -236,5 +259,99 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let result = get_relative_file_path(dir.path(), "/absolutely/nonexistent/file.lean");
         assert!(result.is_none());
+    }
+
+    // ---- detect_lean_project ----
+
+    #[test]
+    fn detect_lean_project_finds_dir_with_lakefile_lean() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("lakefile.lean"), "-- lakefile").unwrap();
+        let result = detect_lean_project(dir.path());
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn detect_lean_project_finds_dir_with_lakefile_toml() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("lakefile.toml"), "[package]").unwrap();
+        let result = detect_lean_project(dir.path());
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn detect_lean_project_finds_dir_with_lean_toolchain() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("lean-toolchain"), "leanprover/lean4:v4.3.0").unwrap();
+        let result = detect_lean_project(dir.path());
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn detect_lean_project_walks_up_from_nested_subdir() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("a").join("b").join("c");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.path().join("lakefile.lean"), "-- lakefile").unwrap();
+        let result = detect_lean_project(&sub);
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn detect_lean_project_starts_from_file_path() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("src");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.path().join("lakefile.lean"), "-- lakefile").unwrap();
+        let file = sub.join("Foo.lean");
+        fs::write(&file, "-- code").unwrap();
+        let result = detect_lean_project(&file);
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn detect_lean_project_returns_none_when_no_markers() {
+        let dir = TempDir::new().unwrap();
+        // Create a deeply nested structure with no markers
+        let sub = dir.path().join("x").join("y");
+        fs::create_dir_all(&sub).unwrap();
+        // Note: This test relies on the temp dir not being inside an actual Lean project.
+        // We test by verifying that starting from within the temp dir, we don't find
+        // the test repo's markers (the temp dir is typically under /tmp which is outside
+        // any Lean project).
+        let result = detect_lean_project(&sub);
+        // The temp dir is under /tmp, so there should be no Lean project above it.
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn detect_lean_project_prefers_nearest_ancestor() {
+        let outer = TempDir::new().unwrap();
+        let inner_dir = outer.path().join("inner");
+        let deep = inner_dir.join("sub");
+        fs::create_dir_all(&deep).unwrap();
+        // Both outer and inner have markers
+        fs::write(outer.path().join("lakefile.lean"), "-- outer").unwrap();
+        fs::write(inner_dir.join("lakefile.lean"), "-- inner").unwrap();
+        let result = detect_lean_project(&deep);
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            inner_dir.canonicalize().unwrap()
+        );
     }
 }
