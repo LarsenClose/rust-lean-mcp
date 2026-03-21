@@ -135,6 +135,7 @@ struct MultiAttemptArgs {
 #[derive(Deserialize)]
 struct RunCodeArgs {
     code: String,
+    file_context: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -378,7 +379,7 @@ async fn dispatch_inner(
             let a: RunCodeArgs = deser(args)?;
             let c = require_client(client)?;
             let pp = require_project(project_path)?;
-            let r = super::run_code::handle_run_code(c, pp, &a.code)
+            let r = super::run_code::handle_run_code(c, pp, &a.code, a.file_context.as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
             to_json(&r)

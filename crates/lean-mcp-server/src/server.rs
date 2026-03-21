@@ -176,6 +176,10 @@ pub struct MultiAttemptAsyncParams {
 pub struct RunCodeParams {
     #[schemars(description = "Self-contained Lean code with imports")]
     pub code: String,
+    #[schemars(
+        description = "Path to a project file whose content provides compilation context. The code snippet is appended to this file's content for compilation, inheriting its imports, namespaces, and section variables."
+    )]
+    pub file_context: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1177,19 +1181,24 @@ impl AppContext {
 
     #[tool(
         name = "lean_run_code",
-        description = "Run a code snippet and return diagnostics. Must include all imports."
+        description = "Run a code snippet and return diagnostics. Must include all imports. Use file_context to compile in the context of an existing project file."
     )]
     async fn lean_run_code(
         &self,
         Parameters(params): Parameters<RunCodeParams>,
     ) -> Result<String, String> {
         let _t = ToolTimer::new("lean_run_code");
-        let project_path = self.resolve_project_path(None)?;
+        let project_path = self.resolve_project_path(params.file_context.as_deref())?;
         let client = self.ensure_client_for(&project_path).await?;
-        tools::run_code::handle_run_code(client.as_ref(), &project_path, &params.code)
-            .await
-            .map(|r| Self::to_json(&r))
-            .map_err(|e| e.to_string())
+        tools::run_code::handle_run_code(
+            client.as_ref(),
+            &project_path,
+            &params.code,
+            params.file_context.as_deref(),
+        )
+        .await
+        .map(|r| Self::to_json(&r))
+        .map_err(|e| e.to_string())
     }
 
     // ---- Verify Theorem ----
