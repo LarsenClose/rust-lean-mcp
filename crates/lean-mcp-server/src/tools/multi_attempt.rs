@@ -156,6 +156,86 @@ pub fn prepare_edit(
     (snippet_str.to_string(), change, goal_line, goal_column)
 }
 
+/// Compute the incremental LSP change that restores the original text after
+/// a forward edit produced by [`prepare_edit`].
+///
+/// Instead of replacing the entire file with `update_file_content`, this builds
+/// a targeted `textDocument/didChange` entry that only touches the edited
+/// region. Lean 4.9+ can then reuse tactic-level snapshots above the edit,
+/// re-elaborating only from the changed line down.
+///
+/// # Arguments
+///
+/// * `original_content` – the full original file content (before any edits)
+/// * `lines`            – lines of the **original** file (from `.lines()`)
+/// * `line_1`           – 1-indexed target line
+/// * `target_col`       – 0-indexed column where the edit starts
+/// * `snippet`          – the snippet that was inserted (same value passed to `prepare_edit`)
+/// * `total_lines`      – number of lines in the original file
+///
+/// # Returns
+///
+/// A JSON value suitable for passing to `client.update_file(path, vec![restore])`.
+pub fn prepare_restore_edit(
+    original_content: &str,
+    lines: &[&str],
+    line_1: u32,
+    target_col: u32,
+    snippet: &str,
+    total_lines: usize,
+) -> Value {
+    let snippet_str = snippet.trim_end_matches('\n');
+    let snippet_lines: Vec<&str> = if snippet_str.is_empty() {
+        vec![""]
+    } else {
+        snippet_str.split('\n').collect()
+    };
+
+    // Number of payload lines produced by prepare_edit (mirrors its logic).
+    let payload_lines_count = snippet_lines.len();
+
+    // After the forward edit the payload occupies payload_lines_count lines
+    // starting at (line_1-1, target_col). The payload always ends with '\n',
+    // so the restore end is at (line_1-1 + payload_lines_count, 0).
+    let restore_end_line_0 = (line_1 - 1) as usize + payload_lines_count;
+
+    // The original edit range: (line_1-1, target_col) to (end_line_0_orig, 0).
+    let replaced_line_count = snippet_lines.len().max(1);
+    let end_line_0_orig = ((line_1 - 1) as usize + replaced_line_count).min(total_lines);
+
+    // Extract the original text by byte offsets from original_content.
+    // Start offset: sum of lengths of lines before line_1-1, plus newlines,
+    // plus target_col.
+    let start_idx = (line_1 - 1) as usize;
+    let start_byte: usize = lines[..start_idx]
+        .iter()
+        .map(|l| l.len() + 1) // +1 for '\n'
+        .sum::<usize>()
+        + target_col as usize;
+
+    // End offset: position (end_line_0_orig, 0).
+    // If end_line_0_orig >= total_lines, this is past the last line, so
+    // use the full content length.
+    let end_byte: usize = if end_line_0_orig >= total_lines {
+        original_content.len()
+    } else {
+        lines[..end_line_0_orig]
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+    };
+
+    let original_text = &original_content[start_byte..end_byte];
+
+    json!({
+        "text": original_text,
+        "range": {
+            "start": {"line": line_1 - 1, "character": target_col},
+            "end": {"line": restore_end_line_0, "character": 0}
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // REPL fast path
 // ---------------------------------------------------------------------------
@@ -464,10 +544,26 @@ pub async fn run_one_snippet_warm(
         lsp_work.await
     };
 
-    // Always restore original content after this snippet
-    let _ = client
-        .update_file_content(file_path, original_content)
-        .await;
+    // Restore via targeted incremental edit so Lean 4.9+ can reuse
+    // tactic-level snapshots above the edited line. Falls back to full
+    // content replacement if the incremental restore fails.
+    let restore_change = prepare_restore_edit(
+        original_content,
+        &lines,
+        line,
+        target_col,
+        snippet,
+        lines.len(),
+    );
+    if client
+        .update_file(file_path, vec![restore_change])
+        .await
+        .is_err()
+    {
+        let _ = client
+            .update_file_content(file_path, original_content)
+            .await;
+    }
 
     match result {
         Ok(r) => r,
@@ -867,8 +963,54 @@ mod tests {
         async fn update_file(
             &self,
             _p: &str,
-            _c: Vec<Value>,
+            changes: Vec<Value>,
         ) -> Result<(), lean_lsp_client::client::LspClientError> {
+            // Apply incremental changes so tests can verify restore correctness.
+            let mut content = self.current_content.lock().unwrap().clone();
+            for change in &changes {
+                if let Some(range) = change.get("range") {
+                    let start_line = range
+                        .pointer("/start/line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    let start_char = range
+                        .pointer("/start/character")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    let end_line = range
+                        .pointer("/end/line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    let end_char = range
+                        .pointer("/end/character")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    let new_text = change.get("text").and_then(Value::as_str).unwrap_or("");
+
+                    // Convert line/char positions to byte offsets.
+                    // When end_line is past the last line, clamp to content length.
+                    let lines: Vec<&str> = content.split('\n').collect();
+                    let line_offset = |l: usize, c: usize| -> usize {
+                        if l >= lines.len() {
+                            content.len()
+                        } else {
+                            lines[..l].iter().map(|s| s.len() + 1).sum::<usize>() + c
+                        }
+                    };
+                    let start_offset = line_offset(start_line, start_char);
+                    let end_offset = line_offset(end_line, end_char);
+
+                    content = format!(
+                        "{}{}{}",
+                        &content[..start_offset],
+                        new_text,
+                        &content[end_offset..]
+                    );
+                } else if let Some(text) = change.get("text").and_then(Value::as_str) {
+                    content = text.to_string();
+                }
+            }
+            *self.current_content.lock().unwrap() = content;
             Ok(())
         }
         async fn update_file_content(
@@ -1246,6 +1388,150 @@ mod tests {
     fn prepare_edit_strips_trailing_newline() {
         let (snippet_str, _, _, _) = prepare_edit("  sorry", 2, "simp\n", 3, 2);
         assert_eq!(snippet_str, "simp");
+    }
+
+    // ---- prepare_restore_edit unit tests ----
+
+    #[test]
+    fn prepare_restore_edit_single_line_snippet() {
+        // File: "theorem foo : True := by\n  sorry" (no trailing newline)
+        let content = "theorem foo : True := by\n  sorry";
+        let lines: Vec<&str> = content.lines().collect();
+
+        let restore = prepare_restore_edit(content, &lines, 2, 2, "simp", lines.len());
+
+        // The restore should undo replacing "sorry" with "simp" on line 2
+        assert_eq!(restore["text"], "sorry");
+        assert_eq!(restore["range"]["start"]["line"], 1);
+        assert_eq!(restore["range"]["start"]["character"], 2);
+        // payload "simp\n" is 1 line, so restore end = 1 + 1 = 2
+        assert_eq!(restore["range"]["end"]["line"], 2);
+        assert_eq!(restore["range"]["end"]["character"], 0);
+    }
+
+    #[test]
+    fn prepare_restore_edit_multiline_snippet() {
+        // File with trailing newline: 3 lines
+        let content = "theorem foo : True := by\n  sorry\n  done\n";
+        let lines: Vec<&str> = content.lines().collect();
+
+        let restore = prepare_restore_edit(content, &lines, 2, 2, "simp\nexact h", lines.len());
+
+        // Original text from (1,2) to (end_line_0,0):
+        // snippet has 2 lines -> replaced_line_count=2
+        // end_line_0 = min(1+2, 3) = 3
+        // Original text from (1,2) to (3,0) = "sorry\n  done\n"
+        assert_eq!(restore["text"], "sorry\n  done\n");
+        assert_eq!(restore["range"]["start"]["line"], 1);
+        assert_eq!(restore["range"]["start"]["character"], 2);
+        // payload has 2 lines -> restore end = 1 + 2 = 3
+        assert_eq!(restore["range"]["end"]["line"], 3);
+        assert_eq!(restore["range"]["end"]["character"], 0);
+    }
+
+    #[test]
+    fn prepare_restore_edit_roundtrip_no_trailing_newline() {
+        // Verify that applying edit then restore produces identical content.
+        let original = "theorem foo : True := by\n  sorry";
+        let lines: Vec<&str> = original.lines().collect();
+        let line_text = lines[1]; // "  sorry"
+        let target_col = 2u32;
+        let snippet = "simp";
+
+        // Forward edit
+        let (_snip, change, _gl, _gc) =
+            prepare_edit(line_text, target_col, snippet, lines.len(), 2);
+
+        // Apply forward edit to content
+        let edited = apply_change(original, &change);
+
+        // Restore edit
+        let restore = prepare_restore_edit(original, &lines, 2, target_col, snippet, lines.len());
+
+        // Apply restore to edited content
+        let restored = apply_change(&edited, &restore);
+
+        assert_eq!(
+            restored, original,
+            "roundtrip must produce identical content"
+        );
+    }
+
+    #[test]
+    fn prepare_restore_edit_roundtrip_with_trailing_newline() {
+        let original = "theorem foo : True := by\n  sorry\n";
+        let lines: Vec<&str> = original.lines().collect();
+        let line_text = lines[1];
+        let target_col = 2u32;
+        let snippet = "simp";
+
+        let (_snip, change, _gl, _gc) =
+            prepare_edit(line_text, target_col, snippet, lines.len(), 2);
+        let edited = apply_change(original, &change);
+        let restore = prepare_restore_edit(original, &lines, 2, target_col, snippet, lines.len());
+        let restored = apply_change(&edited, &restore);
+
+        assert_eq!(
+            restored, original,
+            "roundtrip must produce identical content (trailing newline)"
+        );
+    }
+
+    #[test]
+    fn prepare_restore_edit_roundtrip_multiline_snippet() {
+        let original = "theorem foo : True := by\n  sorry\n  done\n";
+        let lines: Vec<&str> = original.lines().collect();
+        let line_text = lines[1];
+        let target_col = 2u32;
+        let snippet = "simp\nexact h";
+
+        let (_snip, change, _gl, _gc) =
+            prepare_edit(line_text, target_col, snippet, lines.len(), 2);
+        let edited = apply_change(original, &change);
+        let restore = prepare_restore_edit(original, &lines, 2, target_col, snippet, lines.len());
+        let restored = apply_change(&edited, &restore);
+
+        assert_eq!(
+            restored, original,
+            "roundtrip must produce identical content (multiline snippet)"
+        );
+    }
+
+    /// Apply a single LSP incremental change to content (test helper).
+    fn apply_change(content: &str, change: &Value) -> String {
+        let range = change.get("range").expect("change must have range");
+        let start_line = range
+            .pointer("/start/line")
+            .and_then(Value::as_u64)
+            .unwrap() as usize;
+        let start_char = range
+            .pointer("/start/character")
+            .and_then(Value::as_u64)
+            .unwrap() as usize;
+        let end_line = range.pointer("/end/line").and_then(Value::as_u64).unwrap() as usize;
+        let end_char = range
+            .pointer("/end/character")
+            .and_then(Value::as_u64)
+            .unwrap() as usize;
+        let new_text = change.get("text").and_then(Value::as_str).unwrap();
+
+        let parts: Vec<&str> = content.split('\n').collect();
+        let line_offset = |l: usize, c: usize| -> usize {
+            if l >= parts.len() {
+                content.len()
+            } else {
+                parts[..l].iter().map(|s| s.len() + 1).sum::<usize>() + c
+            }
+        };
+        let start_offset = line_offset(start_line, start_char);
+        let end_offset = line_offset(end_line, end_char);
+
+        format!(
+            "{}{}{}",
+            &content[..start_offset],
+            new_text,
+            &content[end_offset..]
+        )
     }
 
     // ---- filter_diagnostics_by_line_range unit tests ----
