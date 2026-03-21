@@ -124,7 +124,7 @@ impl Repl {
     }
 
     /// Start (or restart) the REPL child process.
-    async fn start(&mut self) -> Result<(), String> {
+    pub async fn start(&mut self) -> Result<(), String> {
         // Kill any existing process.
         self.close().await;
 
@@ -232,7 +232,7 @@ impl Repl {
     ///
     /// If the header text is unchanged from a previous call, the cached
     /// environment is reused.
-    async fn load_header(&mut self, header_text: &str) -> Result<u64, String> {
+    pub async fn load_header(&mut self, header_text: &str) -> Result<u64, String> {
         // Check cache
         if let (Some(ref cached_header), Some(env)) = (&self.header, self.header_env) {
             if cached_header == header_text {
@@ -270,7 +270,7 @@ impl Repl {
 
     /// Extract the header (everything before the first declaration keyword) and
     /// body from the base code.
-    fn split_header_body(base_code: &str) -> (String, String) {
+    pub fn split_header_body(base_code: &str) -> (String, String) {
         // Declaration keywords that mark the end of the import block
         let decl_keywords = [
             "theorem ",
@@ -480,6 +480,30 @@ impl Repl {
             .and_then(|arr| arr.last())
             .and_then(|s| s.get("proofState"))
             .and_then(|ps| ps.as_u64())
+    }
+
+    /// Returns the cached header text, if any.
+    pub fn cached_header(&self) -> Option<&str> {
+        self.header.as_deref()
+    }
+
+    /// Returns the cached header environment id, if any.
+    pub fn cached_header_env(&self) -> Option<u64> {
+        self.header_env
+    }
+
+    /// Check whether the REPL child process is still alive.
+    ///
+    /// Returns `true` if a process is running and has not exited,
+    /// `false` if no process exists or it has already exited.
+    pub fn is_alive(&mut self) -> bool {
+        match self.proc.as_mut() {
+            None => false,
+            Some(child) => {
+                // try_wait returns Ok(Some(status)) if exited, Ok(None) if still running
+                matches!(child.try_wait(), Ok(None))
+            }
+        }
     }
 
     /// Close the REPL child process if running.
