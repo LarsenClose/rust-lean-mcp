@@ -232,6 +232,11 @@ struct ProofDiffArgs {
     after_column: Option<u32>,
 }
 
+#[derive(Deserialize)]
+struct ProjectHealthArgs {
+    include_goals: Option<bool>,
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -561,6 +566,32 @@ async fn dispatch_inner(
             to_json(&r)
         }
 
+        "lean_project_health" => {
+            let a: ProjectHealthArgs = deser(args)?;
+            let pp = require_project(project_path)?;
+            let include_goals = a.include_goals.unwrap_or(false);
+            // Only pass the client when goals are requested
+            let c = if include_goals { client } else { None };
+            let r = super::project_health::handle_project_health(pp, c, include_goals)
+                .await
+                .map_err(|e| e.to_string())?;
+            to_json(&r)
+        }
+
+        "lean_server_health" => Err("lean_server_health is not supported inside lean_batch \
+             (requires full server context)."
+            .to_string()),
+
+        "lean_task_result" => Err("lean_task_result is not supported inside lean_batch \
+             (requires task manager context)."
+            .to_string()),
+
+        "lean_multi_attempt_async" => Err(
+            "lean_multi_attempt_async is not supported inside lean_batch \
+             (requires task manager context; use lean_multi_attempt instead)."
+                .to_string(),
+        ),
+
         other => Err(format!("Unknown tool: {other}")),
     }
 }
@@ -671,5 +702,86 @@ mod tests {
         assert_eq!(result.items[0].tool_name, "lean_goal");
         assert_eq!(result.items[1].tool_name, "lean_build");
         assert_eq!(result.items[2].tool_name, "nonexistent");
+    }
+
+    #[tokio::test]
+    async fn project_health_without_project_path_returns_error() {
+        let calls = vec![BatchCall {
+            tool_name: "lean_project_health".into(),
+            arguments: json!({}),
+        }];
+        let result = handle_batch(calls, None, None, &default_config()).await;
+        assert_eq!(result.items.len(), 1);
+        assert!(result.items[0].is_error);
+        assert!(result.items[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .to_lowercase()
+            .contains("project"));
+    }
+
+    #[tokio::test]
+    async fn server_health_not_supported_in_batch() {
+        let calls = vec![BatchCall {
+            tool_name: "lean_server_health".into(),
+            arguments: json!({}),
+        }];
+        let result = handle_batch(calls, None, None, &default_config()).await;
+        assert_eq!(result.items.len(), 1);
+        assert!(result.items[0].is_error);
+        assert!(
+            result.items[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("not supported"),
+            "Expected 'not supported' error, got: {:?}",
+            result.items[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn task_result_not_supported_in_batch() {
+        let calls = vec![BatchCall {
+            tool_name: "lean_task_result".into(),
+            arguments: json!({"task_id": "abc123"}),
+        }];
+        let result = handle_batch(calls, None, None, &default_config()).await;
+        assert_eq!(result.items.len(), 1);
+        assert!(result.items[0].is_error);
+        assert!(
+            result.items[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("not supported"),
+            "Expected 'not supported' error, got: {:?}",
+            result.items[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_attempt_async_not_supported_in_batch() {
+        let calls = vec![BatchCall {
+            tool_name: "lean_multi_attempt_async".into(),
+            arguments: json!({
+                "file_path": "/tmp/test.lean",
+                "line": 1,
+                "snippets": ["simp"]
+            }),
+        }];
+        let result = handle_batch(calls, None, None, &default_config()).await;
+        assert_eq!(result.items.len(), 1);
+        assert!(result.items[0].is_error);
+        assert!(
+            result.items[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("not supported"),
+            "Expected 'not supported' error, got: {:?}",
+            result.items[0].error
+        );
     }
 }
