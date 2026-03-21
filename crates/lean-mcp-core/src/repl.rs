@@ -128,13 +128,22 @@ impl Repl {
         // Kill any existing process.
         self.close().await;
 
-        let child = Command::new(&self.repl_path)
+        // Launch via `lake env <repl>` so that LEAN_PATH and other environment
+        // variables are set correctly, matching the Python implementation.
+        let child = Command::new("lake")
+            .arg("env")
+            .arg(&self.repl_path)
             .current_dir(&self.project_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("Failed to start REPL process '{}': {e}", self.repl_path))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to start REPL process via 'lake env {}': {e}",
+                    self.repl_path
+                )
+            })?;
 
         self.proc = Some(child);
         self.header = None;
@@ -367,13 +376,9 @@ impl Repl {
             }
         };
 
-        // Extract proof state from sorries
-        let proof_state = body_resp
-            .get("sorries")
-            .and_then(|s| s.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|s| s.get("proofState"))
-            .and_then(|ps| ps.as_u64());
+        // Extract proof state from the last sorry (ours is always appended at the end;
+        // earlier entries may be pre-existing sorries in the user code).
+        let proof_state = Self::extract_proof_state(&body_resp);
 
         let proof_state = match proof_state {
             Some(ps) => ps,
@@ -461,6 +466,20 @@ impl Repl {
         }
 
         results
+    }
+
+    /// Extract the proof state id from the *last* sorry in the REPL response.
+    ///
+    /// The appended `sorry` is always the last entry in the `"sorries"` array;
+    /// earlier entries may be pre-existing sorries in the user code. This
+    /// mirrors the Python implementation which uses `sorries[-1]`.
+    fn extract_proof_state(body_resp: &Value) -> Option<u64> {
+        body_resp
+            .get("sorries")
+            .and_then(|s| s.as_array())
+            .and_then(|arr| arr.last())
+            .and_then(|s| s.get("proofState"))
+            .and_then(|ps| ps.as_u64())
     }
 
     /// Close the REPL child process if running.
@@ -698,6 +717,70 @@ mod tests {
         let repl = Repl::new(Path::new("/tmp"), "repl");
         drop(repl);
         // Should not panic
+    }
+
+    // ---- extract_proof_state -----------------------------------------------
+
+    #[test]
+    fn extract_proof_state_single_sorry() {
+        let resp = serde_json::json!({
+            "sorries": [{"proofState": 42, "pos": {"line": 5, "column": 2}}],
+            "env": 1
+        });
+        assert_eq!(Repl::extract_proof_state(&resp), Some(42));
+    }
+
+    #[test]
+    fn extract_proof_state_multiple_sorries_returns_last() {
+        // When the user code already contains sorries, the appended sorry
+        // is the last entry.  We must pick the *last* one, not the first.
+        let resp = serde_json::json!({
+            "sorries": [
+                {"proofState": 10, "pos": {"line": 3, "column": 0}},
+                {"proofState": 20, "pos": {"line": 7, "column": 0}},
+                {"proofState": 30, "pos": {"line": 12, "column": 0}}
+            ],
+            "env": 2
+        });
+        assert_eq!(Repl::extract_proof_state(&resp), Some(30));
+    }
+
+    #[test]
+    fn extract_proof_state_empty_sorries_array() {
+        let resp = serde_json::json!({
+            "sorries": [],
+            "env": 1
+        });
+        assert_eq!(Repl::extract_proof_state(&resp), None);
+    }
+
+    #[test]
+    fn extract_proof_state_missing_sorries_field() {
+        let resp = serde_json::json!({"env": 1});
+        assert_eq!(Repl::extract_proof_state(&resp), None);
+    }
+
+    #[test]
+    fn extract_proof_state_sorry_without_proof_state() {
+        let resp = serde_json::json!({
+            "sorries": [{"pos": {"line": 1, "column": 0}}],
+            "env": 1
+        });
+        assert_eq!(Repl::extract_proof_state(&resp), None);
+    }
+
+    // ---- start (lake env wrapping) -----------------------------------------
+
+    #[tokio::test]
+    async fn start_uses_lake_env_wrapping() {
+        // Verify that a start failure mentions 'lake env' in the error message,
+        // confirming we launch via `lake env <repl_path>`.
+        let mut repl = Repl::new(Path::new("/nonexistent/project"), "/fake/repl");
+        let err = repl.start().await.unwrap_err();
+        assert!(
+            err.contains("lake env"),
+            "Expected error to mention 'lake env', got: {err}"
+        );
     }
 
     // ---- Send + Sync assertions -------------------------------------------
