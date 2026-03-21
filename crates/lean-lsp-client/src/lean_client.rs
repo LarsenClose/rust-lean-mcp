@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncWrite};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::debug;
 
 use crate::client::{path_to_uri, LspClient, LspClientError};
@@ -19,10 +19,52 @@ use crate::multiplexer::{Multiplexer, MultiplexerError};
 /// Default inactivity timeout for waiting on diagnostics (seconds).
 const DEFAULT_DIAG_TIMEOUT_SECS: f64 = 5.0;
 
+/// Grace period after signals agree, for Lean 4.22+ compatibility (ms).
+const ELABORATION_GRACE_MS: u64 = 500;
+
+/// Polling interval for the triple-signal loop (ms).
+const POLL_INTERVAL_MS: u64 = 50;
+
 /// Tracks the state of a file opened in the LSP server.
 struct FileState {
     version: i32,
     content: String,
+}
+
+/// Tracks per-file elaboration progress from `$/lean/fileProgress` notifications
+/// and `textDocument/waitForDiagnostics` RPC results.
+#[derive(Debug, Clone)]
+pub(crate) struct ElaborationState {
+    /// `false` when the `fileProgress.processing` array is empty (elaboration done).
+    pub processing: bool,
+    /// Line ranges currently being processed: `(start_line, end_line)`.
+    pub current_processing: Vec<(u32, u32)>,
+    /// `true` if any processing item has `kind == 2` (fatal error).
+    pub fatal_error: bool,
+    /// `true` once `textDocument/waitForDiagnostics` RPC has returned.
+    pub wait_for_diag_done: bool,
+    /// Reset on any notification for this file.
+    pub last_activity: Instant,
+}
+
+impl ElaborationState {
+    fn new() -> Self {
+        Self {
+            processing: true,
+            current_processing: Vec::new(),
+            fatal_error: false,
+            wait_for_diag_done: false,
+            last_activity: Instant::now(),
+        }
+    }
+
+    /// Returns `true` if no `current_processing` ranges intersect `[start, end]`.
+    pub fn is_line_range_complete(&self, start: u32, end: u32) -> bool {
+        !self
+            .current_processing
+            .iter()
+            .any(|(s, e)| *s <= end && *e >= start)
+    }
 }
 
 /// Concrete [`LspClient`] implementation backed by a [`Multiplexer`].
@@ -41,6 +83,10 @@ pub struct LeanLspClient {
     diag_tx: mpsc::UnboundedSender<String>,
     /// Receives URI updates when new diagnostics arrive.
     diag_rx: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
+    /// Per-file elaboration state from `$/lean/fileProgress` notifications.
+    elaboration_states: Arc<std::sync::Mutex<HashMap<String, ElaborationState>>>,
+    /// Signaled when elaboration state changes (fileProgress or diagnostics).
+    elaboration_notify: Arc<Notify>,
 }
 
 /// Convert a [`MultiplexerError`] to an [`LspClientError`].
@@ -90,9 +136,14 @@ impl LeanLspClient {
         let diagnostics: Arc<std::sync::Mutex<HashMap<String, Vec<Value>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (diag_tx, diag_rx) = mpsc::unbounded_channel();
+        let elaboration_states: Arc<std::sync::Mutex<HashMap<String, ElaborationState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let elaboration_notify = Arc::new(Notify::new());
 
-        // Wire up the notification handler for diagnostics.
+        // Wire up the notification handler for diagnostics and fileProgress.
         let diag_store = Arc::clone(&diagnostics);
+        let elab_states = Arc::clone(&elaboration_states);
+        let elab_notify = Arc::clone(&elaboration_notify);
         let tx = diag_tx.clone();
         multiplexer
             .set_notification_handler(move |method, params| {
@@ -105,7 +156,65 @@ impl LeanLspClient {
                         if let Ok(mut map) = diag_store.lock() {
                             map.insert(uri.to_string(), diag_list);
                         }
+                        // Update last_activity for elaboration tracking.
+                        if let Ok(mut states) = elab_states.lock() {
+                            let state = states
+                                .entry(uri.to_string())
+                                .or_insert_with(ElaborationState::new);
+                            state.last_activity = Instant::now();
+                        }
+                        elab_notify.notify_waiters();
                         let _ = tx.send(uri.to_string());
+                    }
+                } else if method == "$/lean/fileProgress" {
+                    if let Some(uri) = params
+                        .get("textDocument")
+                        .and_then(|td| td.get("uri"))
+                        .and_then(|u| u.as_str())
+                    {
+                        let processing_arr = params
+                            .get("processing")
+                            .and_then(|p| p.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let mut ranges = Vec::new();
+                        let mut has_fatal = false;
+
+                        for item in &processing_arr {
+                            // Extract line range from processing item.
+                            let start_line = item
+                                .get("range")
+                                .and_then(|r| r.get("start"))
+                                .and_then(|s| s.get("line"))
+                                .and_then(|l| l.as_u64())
+                                .unwrap_or(0) as u32;
+                            let end_line = item
+                                .get("range")
+                                .and_then(|r| r.get("end"))
+                                .and_then(|e| e.get("line"))
+                                .and_then(|l| l.as_u64())
+                                .unwrap_or(0) as u32;
+                            ranges.push((start_line, end_line));
+
+                            // kind == 2 indicates a fatal error.
+                            if item.get("kind").and_then(|k| k.as_u64()) == Some(2) {
+                                has_fatal = true;
+                            }
+                        }
+
+                        if let Ok(mut states) = elab_states.lock() {
+                            let state = states
+                                .entry(uri.to_string())
+                                .or_insert_with(ElaborationState::new);
+                            state.processing = !processing_arr.is_empty();
+                            state.current_processing = ranges;
+                            if has_fatal {
+                                state.fatal_error = true;
+                            }
+                            state.last_activity = Instant::now();
+                        }
+                        elab_notify.notify_waiters();
                     }
                 }
             })
@@ -139,6 +248,8 @@ impl LeanLspClient {
             diagnostics,
             diag_tx,
             diag_rx: Arc::new(Mutex::new(diag_rx)),
+            elaboration_states,
+            elaboration_notify,
         })
     }
 
@@ -162,6 +273,54 @@ impl LeanLspClient {
             "textDocument": {"uri": path_to_uri(&self.project_path, relative_path)},
             "position": {"line": line, "character": column}
         })
+    }
+
+    /// Send `textDocument/waitForDiagnostics` RPC and mark state when it returns.
+    ///
+    /// This is a blocking RPC that returns once the Lean server has finished
+    /// computing diagnostics for the given file version. Can be called directly
+    /// or the same logic is inlined in the `get_diagnostics` spawned task.
+    #[allow(dead_code)]
+    async fn send_wait_for_diagnostics(
+        &self,
+        uri: &str,
+        version: i32,
+    ) -> Result<(), LspClientError> {
+        let params = json!({"uri": uri, "version": version});
+        // Use a longer timeout for waitForDiagnostics since elaboration can take a while.
+        let resp = self
+            .multiplexer
+            .request_with_timeout(
+                "textDocument/waitForDiagnostics",
+                Some(params),
+                Duration::from_secs(300),
+            )
+            .await;
+        // Mark state regardless of whether the RPC succeeded — if it errors
+        // (e.g., method not found on older Lean), we still want the fallback
+        // path to work.
+        if let Ok(mut states) = self.elaboration_states.lock() {
+            if let Some(state) = states.get_mut(uri) {
+                state.wait_for_diag_done = true;
+                state.last_activity = Instant::now();
+            }
+        }
+        self.elaboration_notify.notify_waiters();
+        match resp {
+            Ok(_) => Ok(()),
+            Err(MultiplexerError::Timeout(_)) => Err(LspClientError::Timeout {
+                operation: "waitForDiagnostics".to_string(),
+            }),
+            // Method not found is expected on older Lean versions — treat as success.
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Reset elaboration state for a URI (called on open/update).
+    fn reset_elaboration_state(&self, uri: &str) {
+        if let Ok(mut states) = self.elaboration_states.lock() {
+            states.insert(uri.to_string(), ElaborationState::new());
+        }
     }
 }
 
@@ -222,6 +381,9 @@ impl LspClient for LeanLspClient {
         }; // lock released
 
         if let Some((method, params)) = notification {
+            // Reset elaboration state when the file content changes.
+            let uri = path_to_uri(&self.project_path, relative_path);
+            self.reset_elaboration_state(&uri);
             self.multiplexer
                 .notify(method, Some(params))
                 .await
@@ -279,6 +441,8 @@ impl LspClient for LeanLspClient {
             })
         }; // lock released
 
+        let uri = path_to_uri(&self.project_path, relative_path);
+        self.reset_elaboration_state(&uri);
         self.multiplexer
             .notify("textDocument/didChange", Some(params))
             .await
@@ -307,6 +471,8 @@ impl LspClient for LeanLspClient {
             })
         }; // lock released
 
+        let uri = path_to_uri(&self.project_path, relative_path);
+        self.reset_elaboration_state(&uri);
         self.multiplexer
             .notify("textDocument/didChange", Some(params))
             .await
@@ -346,13 +512,134 @@ impl LspClient for LeanLspClient {
         inactivity_timeout: Option<f64>,
     ) -> Result<Value, LspClientError> {
         let uri = path_to_uri(&self.project_path, relative_path);
-        let timeout =
+        let inactivity_dur =
             Duration::from_secs_f64(inactivity_timeout.unwrap_or(DEFAULT_DIAG_TIMEOUT_SECS));
+        // Max overall timeout: 10x inactivity or 60s, whichever is larger.
+        let max_timeout = std::cmp::max(inactivity_dur * 10, Duration::from_secs(60));
+        let grace_period = Duration::from_millis(ELABORATION_GRACE_MS);
+        let poll_interval = Duration::from_millis(POLL_INTERVAL_MS);
 
-        // Wait for diagnostic notifications to stabilize.
+        // Get the file version for waitForDiagnostics.
+        let file_version = {
+            let files = self.open_files.lock().await;
+            files.get(relative_path).map(|f| f.version).unwrap_or(1)
+        };
+
+        // Spawn waitForDiagnostics RPC in background.
+        let wfd_uri = uri.clone();
+        let elab_states = Arc::clone(&self.elaboration_states);
+        let elab_notify = Arc::clone(&self.elaboration_notify);
+        let multiplexer = Arc::clone(&self.multiplexer);
+        tokio::spawn(async move {
+            let params = json!({"uri": wfd_uri, "version": file_version});
+            let resp = multiplexer
+                .request_with_timeout(
+                    "textDocument/waitForDiagnostics",
+                    Some(params),
+                    Duration::from_secs(300),
+                )
+                .await;
+            // Mark done regardless of success/failure.
+            if let Ok(mut states) = elab_states.lock() {
+                if let Some(state) = states.get_mut(&wfd_uri) {
+                    state.wait_for_diag_done = true;
+                    state.last_activity = Instant::now();
+                }
+            }
+            elab_notify.notify_waiters();
+            drop(resp);
+        });
+
+        // Triple-signal polling loop.
+        let loop_start = Instant::now();
+        let mut grace_start: Option<Instant> = None;
+
+        loop {
+            // Check max timeout.
+            if loop_start.elapsed() >= max_timeout {
+                debug!(uri = %uri, "get_diagnostics: max timeout reached");
+                break;
+            }
+
+            // Read elaboration state.
+            let (processing, fatal_error, wait_done, last_activity, range_complete) = {
+                let states = self.elaboration_states.lock().unwrap();
+                if let Some(state) = states.get(&uri) {
+                    let range_done = if let (Some(s), Some(e)) = (start_line, end_line) {
+                        state.is_line_range_complete(s, e)
+                    } else {
+                        false
+                    };
+                    (
+                        state.processing,
+                        state.fatal_error,
+                        state.wait_for_diag_done,
+                        state.last_activity,
+                        range_done,
+                    )
+                } else {
+                    // No elaboration state yet — keep waiting.
+                    (true, false, false, Instant::now(), false)
+                }
+            };
+
+            // Signal (a): both fileProgress and waitForDiagnostics agree elaboration is done.
+            if !processing && wait_done {
+                match grace_start {
+                    None => {
+                        grace_start = Some(Instant::now());
+                    }
+                    Some(gs) if gs.elapsed() >= grace_period => {
+                        debug!(uri = %uri, "get_diagnostics: triple-signal complete");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // Signal (b): fatal error — done immediately.
+            else if fatal_error {
+                debug!(uri = %uri, "get_diagnostics: fatal error detected");
+                break;
+            }
+            // Signal (c): partial range complete (when start_line/end_line specified).
+            else if range_complete && (wait_done || !processing) {
+                match grace_start {
+                    None => {
+                        grace_start = Some(Instant::now());
+                    }
+                    Some(gs) if gs.elapsed() >= grace_period => {
+                        debug!(uri = %uri, "get_diagnostics: line range complete");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // Signal (d): inactivity timeout — pure fallback, fires when no
+            // notifications have arrived for the full inactivity duration.
+            // This preserves backward compatibility with the old timeout-only
+            // approach and handles servers that don't support fileProgress.
+            else if last_activity.elapsed() >= inactivity_dur {
+                debug!(uri = %uri, "get_diagnostics: inactivity timeout fallback");
+                break;
+            }
+            // No signals ready yet — reset grace if conditions no longer hold.
+            else {
+                grace_start = None;
+            }
+
+            // Wait for a signal or poll interval, whichever comes first.
+            tokio::select! {
+                _ = self.elaboration_notify.notified() => {}
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+        }
+
+        // Also drain any pending diagnostic notifications to get latest state.
         {
             let mut rx = self.diag_rx.lock().await;
-            while let Ok(Some(_)) = tokio::time::timeout(timeout, rx.recv()).await {}
+            while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(10), rx.recv()).await
+            {
+            }
         }
 
         let all_diags = {
@@ -1189,5 +1476,519 @@ mod tests {
             }
             other => panic!("Expected LspError, got: {other:?}"),
         }
+    }
+
+    // ── ElaborationState unit tests ────────────────────────────────
+
+    #[test]
+    fn elaboration_state_new_defaults() {
+        let state = ElaborationState::new();
+        assert!(state.processing);
+        assert!(state.current_processing.is_empty());
+        assert!(!state.fatal_error);
+        assert!(!state.wait_for_diag_done);
+    }
+
+    #[test]
+    fn is_line_range_complete_no_processing() {
+        let state = ElaborationState {
+            processing: false,
+            current_processing: vec![],
+            fatal_error: false,
+            wait_for_diag_done: false,
+            last_activity: Instant::now(),
+        };
+        assert!(state.is_line_range_complete(0, 100));
+        assert!(state.is_line_range_complete(50, 50));
+    }
+
+    #[test]
+    fn is_line_range_complete_no_overlap() {
+        let state = ElaborationState {
+            processing: true,
+            current_processing: vec![(10, 20), (50, 60)],
+            fatal_error: false,
+            wait_for_diag_done: false,
+            last_activity: Instant::now(),
+        };
+        // Range 0-9 does not overlap with (10,20) or (50,60).
+        assert!(state.is_line_range_complete(0, 9));
+        // Range 25-45 does not overlap.
+        assert!(state.is_line_range_complete(25, 45));
+        // Range 65-100 does not overlap.
+        assert!(state.is_line_range_complete(65, 100));
+    }
+
+    #[test]
+    fn is_line_range_complete_with_overlap() {
+        let state = ElaborationState {
+            processing: true,
+            current_processing: vec![(10, 20), (50, 60)],
+            fatal_error: false,
+            wait_for_diag_done: false,
+            last_activity: Instant::now(),
+        };
+        // Range 5-15 overlaps with (10,20).
+        assert!(!state.is_line_range_complete(5, 15));
+        // Range 15-55 overlaps with both.
+        assert!(!state.is_line_range_complete(15, 55));
+        // Range 55-65 overlaps with (50,60).
+        assert!(!state.is_line_range_complete(55, 65));
+        // Exact match.
+        assert!(!state.is_line_range_complete(10, 20));
+        // Single line inside range.
+        assert!(!state.is_line_range_complete(15, 15));
+    }
+
+    #[test]
+    fn is_line_range_complete_boundary_cases() {
+        let state = ElaborationState {
+            processing: true,
+            current_processing: vec![(10, 20)],
+            fatal_error: false,
+            wait_for_diag_done: false,
+            last_activity: Instant::now(),
+        };
+        // Touching at boundary: range ends at 10, processing starts at 10.
+        assert!(!state.is_line_range_complete(5, 10));
+        // Touching at other boundary.
+        assert!(!state.is_line_range_complete(20, 25));
+        // Just outside.
+        assert!(state.is_line_range_complete(21, 25));
+        assert!(state.is_line_range_complete(0, 9));
+    }
+
+    // ── fileProgress notification handler tests ─────────────────────
+
+    #[tokio::test]
+    async fn file_progress_updates_elaboration_state() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "FP.lean", "x").await;
+
+        let uri = path_to_uri(client.project_path(), "FP.lean");
+
+        // Send a fileProgress notification with processing ranges.
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "$/lean/fileProgress",
+            "params": {
+                "textDocument": {"uri": uri},
+                "processing": [
+                    {
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 0}},
+                        "kind": 1
+                    },
+                    {
+                        "range": {"start": {"line": 10, "character": 0}, "end": {"line": 15, "character": 0}},
+                        "kind": 1
+                    }
+                ]
+            }
+        });
+        write_message(&mut sw, &notif).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let states = client.elaboration_states.lock().unwrap();
+        let state = states.get(&uri).unwrap();
+        assert!(state.processing);
+        assert_eq!(state.current_processing.len(), 2);
+        assert_eq!(state.current_processing[0], (0, 5));
+        assert_eq!(state.current_processing[1], (10, 15));
+        assert!(!state.fatal_error);
+    }
+
+    #[tokio::test]
+    async fn file_progress_empty_processing_sets_not_processing() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "EP.lean", "x").await;
+
+        let uri = path_to_uri(client.project_path(), "EP.lean");
+
+        // Send fileProgress with empty processing array.
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "$/lean/fileProgress",
+            "params": {
+                "textDocument": {"uri": uri},
+                "processing": []
+            }
+        });
+        write_message(&mut sw, &notif).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let states = client.elaboration_states.lock().unwrap();
+        let state = states.get(&uri).unwrap();
+        assert!(!state.processing);
+        assert!(state.current_processing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_progress_kind_2_sets_fatal_error() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "FE.lean", "x").await;
+
+        let uri = path_to_uri(client.project_path(), "FE.lean");
+
+        // Send fileProgress with kind == 2 (fatal error).
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "$/lean/fileProgress",
+            "params": {
+                "textDocument": {"uri": uri},
+                "processing": [
+                    {
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 0}},
+                        "kind": 2
+                    }
+                ]
+            }
+        });
+        write_message(&mut sw, &notif).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let states = client.elaboration_states.lock().unwrap();
+        let state = states.get(&uri).unwrap();
+        assert!(state.fatal_error);
+    }
+
+    // ── Triple-signal get_diagnostics tests ─────────────────────────
+
+    #[tokio::test]
+    async fn get_diagnostics_triple_signal_fast_completion() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "TS.lean", "x").await;
+
+        let uri = path_to_uri(client.project_path(), "TS.lean");
+
+        // Spawn a server task that:
+        // 1. Sends fileProgress with empty processing (elaboration done)
+        // 2. Responds to waitForDiagnostics
+        // 3. Sends publishDiagnostics
+        let server = tokio::spawn(async move {
+            // Wait for the waitForDiagnostics request.
+            let req = read_message(&mut sr).await.unwrap();
+            assert_eq!(req["method"], "textDocument/waitForDiagnostics");
+            let id = req["id"].as_i64().unwrap();
+
+            // Send fileProgress with empty processing (done).
+            let fp_notif = json!({
+                "jsonrpc": "2.0",
+                "method": "$/lean/fileProgress",
+                "params": {
+                    "textDocument": {"uri": uri.clone()},
+                    "processing": []
+                }
+            });
+            write_message(&mut sw, &fp_notif).await.unwrap();
+
+            // Send diagnostics.
+            let diag_notif = json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": uri.clone(),
+                    "diagnostics": [{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"message":"err","severity":1}]
+                }
+            });
+            write_message(&mut sw, &diag_notif).await.unwrap();
+
+            // Respond to waitForDiagnostics.
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":id,"result":null}))
+                .await
+                .unwrap();
+        });
+
+        let start = Instant::now();
+        let result = client
+            .get_diagnostics("TS.lean", None, None, Some(5.0))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // Should complete much faster than the 5s inactivity timeout.
+        // The grace period is 500ms, so it should be around 500-700ms.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Triple-signal should complete in ~500ms, took {elapsed:?}"
+        );
+
+        let diags = result.as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["message"], "err");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_diagnostics_fatal_error_returns_immediately() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "Fatal.lean", "x").await;
+
+        let uri = path_to_uri(client.project_path(), "Fatal.lean");
+
+        // Spawn server that sends fatal fileProgress then a diagnostic.
+        let server = tokio::spawn(async move {
+            // Read the waitForDiagnostics request but don't respond immediately.
+            let _req = read_message(&mut sr).await.unwrap();
+
+            // Send fileProgress with kind == 2 (fatal).
+            let fp_notif = json!({
+                "jsonrpc": "2.0",
+                "method": "$/lean/fileProgress",
+                "params": {
+                    "textDocument": {"uri": uri.clone()},
+                    "processing": [{
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
+                        "kind": 2
+                    }]
+                }
+            });
+            write_message(&mut sw, &fp_notif).await.unwrap();
+
+            // Send a diagnostic too.
+            let diag_notif = json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": uri,
+                    "diagnostics": [{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"message":"fatal error","severity":1}]
+                }
+            });
+            write_message(&mut sw, &diag_notif).await.unwrap();
+        });
+
+        let start = Instant::now();
+        let result = client
+            .get_diagnostics("Fatal.lean", None, None, Some(5.0))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // Fatal error should cause immediate return (no grace period).
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Fatal error should return quickly, took {elapsed:?}"
+        );
+
+        let diags = result.as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["message"], "fatal error");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_diagnostics_inactivity_fallback() {
+        // Tests that the inactivity timeout works as fallback when no
+        // fileProgress or waitForDiagnostics signals arrive.
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "Inact.lean", "x").await;
+
+        let uri = path_to_uri(client.project_path(), "Inact.lean");
+
+        // Send diagnostics but no fileProgress.
+        let diag_notif = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri,
+                "diagnostics": [{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"message":"timeout err","severity":1}]
+            }
+        });
+        write_message(&mut sw, &diag_notif).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let start = Instant::now();
+        let result = client
+            .get_diagnostics("Inact.lean", None, None, Some(0.15))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // Should fire after the 150ms inactivity timeout.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Inactivity fallback should fire quickly, took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "Should have waited at least ~150ms, took {elapsed:?}"
+        );
+
+        let diags = result.as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["message"], "timeout err");
+    }
+
+    #[tokio::test]
+    async fn elaboration_state_resets_on_open_file() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "Reset.lean", "x").await;
+
+        let uri = path_to_uri(client.project_path(), "Reset.lean");
+
+        // Send fileProgress to set some state.
+        let fp = json!({
+            "jsonrpc": "2.0",
+            "method": "$/lean/fileProgress",
+            "params": {
+                "textDocument": {"uri": uri.clone()},
+                "processing": []
+            }
+        });
+        write_message(&mut sw, &fp).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        {
+            let states = client.elaboration_states.lock().unwrap();
+            let state = states.get(&uri).unwrap();
+            assert!(!state.processing);
+        }
+
+        // Re-open the file with changed content — should reset state.
+        std::fs::write(dir.path().join("Reset.lean"), "y").unwrap();
+        client.open_file("Reset.lean").await.unwrap();
+        let _ = read_message(&mut sr).await.unwrap(); // drain didChange
+
+        {
+            let states = client.elaboration_states.lock().unwrap();
+            let state = states.get(&uri).unwrap();
+            // After reset, processing should be true (default).
+            assert!(state.processing);
+            assert!(!state.wait_for_diag_done);
+            assert!(!state.fatal_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn elaboration_state_resets_on_update_file_content() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "ResetU.lean", "x").await;
+
+        let uri = path_to_uri(client.project_path(), "ResetU.lean");
+
+        // Set some elaboration state.
+        let fp = json!({
+            "jsonrpc": "2.0",
+            "method": "$/lean/fileProgress",
+            "params": {
+                "textDocument": {"uri": uri.clone()},
+                "processing": []
+            }
+        });
+        write_message(&mut sw, &fp).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        {
+            let states = client.elaboration_states.lock().unwrap();
+            assert!(!states.get(&uri).unwrap().processing);
+        }
+
+        // Update file content — should reset state.
+        client
+            .update_file_content("ResetU.lean", "new content")
+            .await
+            .unwrap();
+        let _ = read_message(&mut sr).await.unwrap(); // drain didChange
+
+        {
+            let states = client.elaboration_states.lock().unwrap();
+            let state = states.get(&uri).unwrap();
+            assert!(state.processing);
+            assert!(!state.wait_for_diag_done);
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_diagnostics_updates_last_activity() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "LA.lean", "x").await;
+
+        let uri = path_to_uri(client.project_path(), "LA.lean");
+
+        // Record the current time.
+        let before = Instant::now();
+
+        // Send publishDiagnostics.
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri.clone(),
+                "diagnostics": []
+            }
+        });
+        write_message(&mut sw, &notif).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let states = client.elaboration_states.lock().unwrap();
+        let state = states.get(&uri).unwrap();
+        // last_activity should be after our `before` timestamp.
+        assert!(state.last_activity >= before);
+    }
+
+    #[tokio::test]
+    async fn get_diagnostics_line_range_early_return() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "LR.lean", "a\nb\nc\nd\ne").await;
+
+        let uri = path_to_uri(client.project_path(), "LR.lean");
+
+        // Spawn server that:
+        // 1. Receives waitForDiagnostics but doesn't respond
+        // 2. Sends fileProgress showing lines 3-4 still processing (but 0-2 done)
+        // 3. Sends diagnostics for all lines
+        let server = tokio::spawn(async move {
+            // Read waitForDiagnostics, hold it.
+            let _req = read_message(&mut sr).await.unwrap();
+
+            // Send fileProgress: only lines 3-4 still processing.
+            let fp = json!({
+                "jsonrpc": "2.0",
+                "method": "$/lean/fileProgress",
+                "params": {
+                    "textDocument": {"uri": uri.clone()},
+                    "processing": [{
+                        "range": {"start": {"line": 3, "character": 0}, "end": {"line": 4, "character": 0}},
+                        "kind": 1
+                    }]
+                }
+            });
+            write_message(&mut sw, &fp).await.unwrap();
+
+            // Send diagnostics for lines 0-1.
+            let diag = json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": uri,
+                    "diagnostics": [
+                        {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"message":"err0"},
+                        {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"message":"err1"}
+                    ]
+                }
+            });
+            write_message(&mut sw, &diag).await.unwrap();
+        });
+
+        let start = Instant::now();
+        // Request diagnostics for lines 0-1 only — should return early since
+        // that range is not being processed.
+        let result = client
+            .get_diagnostics("LR.lean", Some(0), Some(1), Some(5.0))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // Should complete much faster than the 5s timeout (grace period ~500ms).
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Line range should complete early, took {elapsed:?}"
+        );
+
+        let diags = result.as_array().unwrap();
+        assert_eq!(diags.len(), 2);
+
+        server.await.unwrap();
     }
 }
