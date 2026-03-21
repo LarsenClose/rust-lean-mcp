@@ -74,10 +74,14 @@ impl Default for SearchConfig {
     }
 }
 
-/// Build a shared `reqwest::Client` with a reasonable timeout.
+/// Build a shared `reqwest::Client` with a reasonable timeout and User-Agent.
+///
+/// A User-Agent header is required by several search APIs (e.g. loogle.lean-lang.org
+/// returns 502 without one).
 fn http_client() -> Result<reqwest::Client, LeanToolError> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .user_agent("lean-lsp-mcp/0.1")
         .build()
         .map_err(|e| LeanToolError::Other(format!("Failed to build HTTP client: {e}")))
 }
@@ -134,10 +138,14 @@ pub async fn handle_leansearch(
 /// Parse the nested LeanSearch response.
 ///
 /// The API returns `results[0][i].result` where each result has:
-/// - `name`: array of strings -> joined
-/// - `module_name`: array of strings -> joined
+/// - `name`: array of strings -> joined with `"."`
+/// - `module_name`: array of strings -> joined with `"."`
 /// - `kind`: string
-/// - `type`: array of strings -> joined
+/// - `type`: raw value (string or stringified)
+///
+/// Name and module_name arrays contain plain segments that must be
+/// dot-joined, matching the Python reference: `".".join(r["name"])`.
+/// The type field is taken as a raw value (Python: `r.get("type")`).
 fn parse_leansearch_results(json: &Value) -> Vec<LeanSearchResult> {
     let Some(results) = json.get("results").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -151,13 +159,15 @@ fn parse_leansearch_results(json: &Value) -> Vec<LeanSearchResult> {
         .filter_map(|entry| {
             let result = entry.get("result")?;
 
-            let name = join_string_array(result.get("name")?);
-            let module_name = join_module_segments(result.get("module_name")?);
+            let name = join_dot_segments(result.get("name")?);
+            let module_name = join_dot_segments(result.get("module_name")?);
             let kind = result
                 .get("kind")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let r#type = result.get("type").map(join_string_array);
+            // Type is taken as a raw value: string directly, or stringified for
+            // non-string types (matching Python's `r.get("type")`).
+            let r#type = result.get("type").map(value_as_string);
 
             Some(LeanSearchResult {
                 name,
@@ -169,27 +179,12 @@ fn parse_leansearch_results(json: &Value) -> Vec<LeanSearchResult> {
         .collect()
 }
 
-/// Join a JSON value that is either a string or an array of strings.
+/// Join a JSON value that is either a string or an array of string segments
+/// with dot separators.
 ///
-/// Uses empty-string join because name arrays contain their own separators
-/// (e.g. `["Continuous", ".comp"]` → `"Continuous.comp"`).
-fn join_string_array(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Array(arr) => arr
-            .iter()
-            .filter_map(|x| x.as_str())
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
-}
-
-/// Join a JSON value that is either a string or an array of clean segments.
-///
-/// Uses dot-separator join for module_name arrays whose elements are plain
-/// segments (e.g. `["Mathlib", "Topology", "Basic"]` → `"Mathlib.Topology.Basic"`).
-fn join_module_segments(v: &Value) -> String {
+/// Matches the Python reference: `".".join(r["name"])` and `".".join(r["module_name"])`.
+/// Segments are plain identifiers (e.g. `["Nat", "add", "comm"]` → `"Nat.add.comm"`).
+fn join_dot_segments(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Array(arr) => arr
@@ -198,6 +193,20 @@ fn join_module_segments(v: &Value) -> String {
             .collect::<Vec<_>>()
             .join("."),
         _ => String::new(),
+    }
+}
+
+/// Convert a JSON value to a string representation.
+///
+/// - String values are returned as-is.
+/// - Other types (arrays, numbers, etc.) are JSON-serialized.
+///
+/// This matches the Python behavior of passing `r.get("type")` directly
+/// to a Pydantic `Optional[str]` field.
+fn value_as_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -319,26 +328,38 @@ pub async fn handle_leanfinder(
 
 /// Parse LeanFinder results, filtering to mathlib4 entries.
 ///
-/// Response is an array of objects with:
-/// - `corpus`: must contain "mathlib4"
-/// - `url`: contains the full_name after the last `/` (URL-decoded)
+/// Response is `{"results": [...]}` where each entry has:
+/// - `url`: must contain the mathlib4_docs base URL; name extracted via
+///   regex `pattern=(.*?)#doc`
 /// - `formal_statement`: the Lean type signature
 /// - `informal_statement`: natural language description
+///
+/// Matches the Python reference which accesses `data["results"]` and
+/// filters by checking `"mathlib4_docs" not in result["url"]`.
 fn parse_leanfinder_results(json: &Value) -> Vec<LeanFinderResult> {
-    let Some(arr) = json.as_array() else {
+    // The API returns {"results": [...]}, not a top-level array.
+    let arr = json
+        .get("results")
+        .and_then(|v| v.as_array())
+        .or_else(|| json.as_array());
+
+    let Some(arr) = arr else {
         return Vec::new();
     };
 
     arr.iter()
         .filter_map(|entry| {
-            // Filter to mathlib4 results
-            let corpus = entry.get("corpus")?.as_str()?;
-            if !corpus.contains("mathlib4") {
+            let url = entry.get("url")?.as_str()?;
+
+            // Filter to mathlib4 results by checking URL contains mathlib4_docs
+            // (matches Python: "mathlib4_docs" not in result["url"])
+            if !url.contains("mathlib4_docs") {
                 return None;
             }
 
-            let url = entry.get("url")?.as_str()?;
-            let full_name = extract_name_from_url(url);
+            // Extract name using pattern= URL matching (matches Python:
+            // re.search(r"pattern=(.*?)#doc", result["url"]))
+            let full_name = extract_name_from_url(url)?;
 
             let formal_statement = entry
                 .get("formal_statement")
@@ -361,21 +382,19 @@ fn parse_leanfinder_results(json: &Value) -> Vec<LeanFinderResult> {
         .collect()
 }
 
-/// Extract the declaration name from a Mathlib URL.
+/// Extract the declaration name from a Mathlib URL using the
+/// `?pattern=NAME#doc` format.
 ///
-/// Handles two formats:
-/// - `.html` suffix: `.../Foo.Bar.html` → `Foo.Bar`
-/// - `?pattern=NAME#doc`: `.../find/?pattern=mul_comm#doc` → `mul_comm`
-fn extract_name_from_url(url: &str) -> String {
-    // Try ?pattern=NAME#doc format (LeanFinder)
-    if let Some(idx) = url.find("?pattern=") {
-        let after = &url[idx + "?pattern=".len()..];
-        let name = after.split('#').next().unwrap_or(after);
-        return name.to_string();
+/// Returns `None` if the URL does not contain `pattern=...#doc`,
+/// matching the Python reference: `re.search(r"pattern=(.*?)#doc", url)`.
+fn extract_name_from_url(url: &str) -> Option<String> {
+    let idx = url.find("pattern=")?;
+    let after = &url[idx + "pattern=".len()..];
+    let name = after.split('#').next().unwrap_or(after);
+    if name.is_empty() {
+        return None;
     }
-    // Fall back to last path segment with .html stripped
-    let segment = url.rsplit('/').next().unwrap_or(url);
-    segment.strip_suffix(".html").unwrap_or(segment).to_string()
+    Some(name.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -803,18 +822,18 @@ mod tests {
                 "results": [[
                     {
                         "result": {
-                            "name": ["Nat", ".", "add", "_", "comm"],
+                            "name": ["Nat", "add_comm"],
                             "module_name": ["Init", "Data", "Nat"],
                             "kind": "theorem",
-                            "type": ["forall", " (n m : Nat), n + m = m + n"]
+                            "type": "forall (n m : Nat), n + m = m + n"
                         }
                     },
                     {
                         "result": {
-                            "name": ["Nat", ".", "mul", "_", "comm"],
+                            "name": ["Nat", "mul_comm"],
                             "module_name": ["Init", "Data", "Nat"],
                             "kind": "theorem",
-                            "type": ["forall", " (n m : Nat), n * m = m * n"]
+                            "type": "forall (n m : Nat), n * m = m * n"
                         }
                     }
                 ]]
@@ -985,26 +1004,25 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {
-                    "corpus": "mathlib4",
-                    "url": "https://leanprover-community.github.io/mathlib4_docs/Mathlib/Algebra/Group/Nat.add_comm.html",
-                    "formal_statement": "theorem Nat.add_comm : forall n m, n + m = m + n",
-                    "informal_statement": "Commutativity of natural number addition"
-                },
-                {
-                    "corpus": "other_corpus",
-                    "url": "https://example.com/Other.html",
-                    "formal_statement": "def other",
-                    "informal_statement": "Not mathlib4"
-                },
-                {
-                    "corpus": "mathlib4",
-                    "url": "https://leanprover-community.github.io/mathlib4_docs/Mathlib/Algebra/Group/Nat.mul_comm.html",
-                    "formal_statement": "theorem Nat.mul_comm : forall n m, n * m = m * n",
-                    "informal_statement": "Commutativity of natural number multiplication"
-                }
-            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {
+                        "url": "https://leanprover-community.github.io/mathlib4_docs/find/?pattern=Nat.add_comm#doc",
+                        "formal_statement": "theorem Nat.add_comm : forall n m, n + m = m + n",
+                        "informal_statement": "Commutativity of natural number addition"
+                    },
+                    {
+                        "url": "https://example.com/Other.html",
+                        "formal_statement": "def other",
+                        "informal_statement": "Not mathlib4"
+                    },
+                    {
+                        "url": "https://leanprover-community.github.io/mathlib4_docs/find/?pattern=Nat.mul_comm#doc",
+                        "formal_statement": "theorem Nat.mul_comm : forall n m, n * m = m * n",
+                        "informal_statement": "Commutativity of natural number multiplication"
+                    }
+                ]
+            })))
             .mount(&server)
             .await;
 
@@ -1013,7 +1031,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Only mathlib4 results should be included
+        // Only mathlib4_docs URLs should be included
         assert_eq!(result.items.len(), 2);
         assert_eq!(result.items[0].full_name, "Nat.add_comm");
         assert_eq!(result.items[1].full_name, "Nat.mul_comm");
@@ -1024,14 +1042,15 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {
-                    "corpus": "mathlib4",
-                    "url": "https://leanprover-community.github.io/mathlib4_docs/Mathlib/Topology/Basic/IsOpen.html",
-                    "formal_statement": "def IsOpen",
-                    "informal_statement": "An open set"
-                }
-            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {
+                        "url": "https://leanprover-community.github.io/mathlib4_docs/find/?pattern=IsOpen#doc",
+                        "formal_statement": "def IsOpen",
+                        "informal_statement": "An open set"
+                    }
+                ]
+            })))
             .mount(&server)
             .await;
 
@@ -1049,7 +1068,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": []})))
             .mount(&server)
             .await;
 
@@ -1288,39 +1307,46 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn join_string_array_from_array() {
-        let v = json!(["Nat", ".", "add", "_", "comm"]);
-        assert_eq!(join_string_array(&v), "Nat.add_comm");
+    fn join_dot_segments_from_array() {
+        let v = json!(["Nat", "add_comm"]);
+        assert_eq!(join_dot_segments(&v), "Nat.add_comm");
     }
 
     #[test]
-    fn join_string_array_from_string() {
+    fn join_dot_segments_from_string() {
         let v = json!("Nat.add_comm");
-        assert_eq!(join_string_array(&v), "Nat.add_comm");
+        assert_eq!(join_dot_segments(&v), "Nat.add_comm");
     }
 
     #[test]
-    fn join_string_array_from_non_string() {
+    fn join_dot_segments_from_non_string() {
         let v = json!(42);
-        assert_eq!(join_string_array(&v), "");
+        assert_eq!(join_dot_segments(&v), "");
     }
 
     #[test]
-    fn join_module_segments_from_array() {
-        let v = json!(["Mathlib", "Topology", "Basic"]);
-        assert_eq!(join_module_segments(&v), "Mathlib.Topology.Basic");
+    fn join_dot_segments_single_element() {
+        let v = json!(["continuous_id"]);
+        assert_eq!(join_dot_segments(&v), "continuous_id");
     }
 
     #[test]
-    fn join_module_segments_from_string() {
-        let v = json!("Mathlib.Topology.Basic");
-        assert_eq!(join_module_segments(&v), "Mathlib.Topology.Basic");
+    fn value_as_string_from_string() {
+        let v = json!("Continuous id");
+        assert_eq!(value_as_string(&v), "Continuous id");
     }
 
     #[test]
-    fn join_module_segments_from_non_string() {
+    fn value_as_string_from_non_string() {
         let v = json!(42);
-        assert_eq!(join_module_segments(&v), "");
+        assert_eq!(value_as_string(&v), "42");
+    }
+
+    #[test]
+    fn value_as_string_from_array() {
+        let v = json!(["Continuous ", "g"]);
+        // Non-string values are JSON-serialized
+        assert_eq!(value_as_string(&v), "[\"Continuous \",\"g\"]");
     }
 
     #[test]
@@ -1329,26 +1355,24 @@ mod tests {
             extract_name_from_url(
                 "https://leanprover-community.github.io/mathlib4_docs/find/?pattern=mul_comm#doc"
             ),
-            "mul_comm"
+            Some("mul_comm".to_string())
         );
     }
 
     #[test]
-    fn extract_name_from_url_with_html_extension() {
+    fn extract_name_from_url_without_pattern() {
+        // URLs without pattern= should return None (matching Python regex behavior)
         assert_eq!(
             extract_name_from_url(
                 "https://leanprover-community.github.io/mathlib4_docs/Mathlib/Algebra/Nat.add_comm.html"
             ),
-            "Nat.add_comm"
+            None
         );
     }
 
     #[test]
-    fn extract_name_from_url_no_html_extension() {
-        assert_eq!(
-            extract_name_from_url("https://example.com/SomeName"),
-            "SomeName"
-        );
+    fn extract_name_from_url_no_match() {
+        assert_eq!(extract_name_from_url("https://example.com/SomeName"), None);
     }
 
     #[test]
@@ -1407,21 +1431,22 @@ mod tests {
         );
         assert_eq!(results.len(), 4, "Expected 4 results from fixture");
 
-        // Name arrays should be concatenated (no dots — join(""))
+        // Name segments dot-joined: ".".join(["Continuous", "comp"]) = "Continuous.comp"
         assert_eq!(results[0].name, "Continuous.comp");
         assert_eq!(
             results[0].module_name,
             "Mathlib.Topology.ContinuousOn.Basic"
         );
         assert_eq!(results[0].kind, Some("theorem".to_string()));
-        // Type from array is also concatenated
+        // Type is taken as raw string value
         assert!(results[0]
             .r#type
             .as_ref()
             .is_some_and(|t| t.contains("Continuous")),);
 
-        // Scalar string type passes through unchanged
+        // Single-element name array: ".".join(["continuous_id"]) = "continuous_id"
         assert_eq!(results[2].name, "continuous_id");
+        // Scalar string type passes through unchanged
         assert_eq!(results[2].r#type, Some("Continuous id".to_string()));
     }
 
@@ -1453,13 +1478,16 @@ mod tests {
 
         let results = parse_leanfinder_results(&fixture_json);
 
-        // Should filter out the lean4 corpus entry
+        // Should filter out the non-mathlib4_docs URL entry
         assert_eq!(results.len(), 3, "Expected 3 mathlib4 results");
 
         // Name extracted from ?pattern=NAME#doc URL format
         assert_eq!(results[0].full_name, "mul_comm");
         assert!(results[0].formal_statement.contains("a * b = b * a"));
         assert!(results[0].informal_statement.contains("commutative"));
+
+        assert_eq!(results[1].full_name, "add_comm");
+        assert_eq!(results[2].full_name, "Commute");
     }
 
     #[test]
@@ -1494,5 +1522,197 @@ mod tests {
         assert!(matches[1].1.contains("def myHelper"));
         assert!(matches[2].1.contains("class MyGroup"));
         assert!(matches[3].0.contains(".lake/packages/mathlib"));
+    }
+
+    // =====================================================================
+    // Bug fix regression tests (#126, #127, #128)
+    // =====================================================================
+
+    /// #126: leansearch name segments must be dot-joined.
+    #[test]
+    fn leansearch_name_dot_joined() {
+        let json = json!({
+            "results": [[
+                {
+                    "result": {
+                        "name": ["Nat", "add", "comm"],
+                        "module_name": ["Init", "Data", "Nat"],
+                        "kind": "theorem",
+                        "type": "forall (n m : Nat), n + m = m + n"
+                    }
+                }
+            ]]
+        });
+        let results = parse_leansearch_results(&json);
+        assert_eq!(results.len(), 1);
+        // Segments dot-joined: "Nat" + "." + "add" + "." + "comm"
+        assert_eq!(results[0].name, "Nat.add.comm");
+    }
+
+    /// #126: leansearch type field taken as raw string, not joined from array.
+    #[test]
+    fn leansearch_type_as_raw_value() {
+        let json = json!({
+            "results": [[
+                {
+                    "result": {
+                        "name": ["Foo"],
+                        "module_name": ["Bar"],
+                        "kind": "def",
+                        "type": "Nat → Nat"
+                    }
+                }
+            ]]
+        });
+        let results = parse_leansearch_results(&json);
+        assert_eq!(results[0].r#type, Some("Nat → Nat".to_string()));
+    }
+
+    /// #126: leansearch type field handles non-string values (serialized).
+    #[test]
+    fn leansearch_type_non_string_serialized() {
+        let json = json!({
+            "results": [[
+                {
+                    "result": {
+                        "name": ["Foo"],
+                        "module_name": ["Bar"],
+                        "kind": "def",
+                        "type": ["Continuous ", "f"]
+                    }
+                }
+            ]]
+        });
+        let results = parse_leansearch_results(&json);
+        // Non-string type values are JSON-serialized
+        assert!(results[0].r#type.is_some());
+    }
+
+    /// #126: leanfinder parses from {"results": [...]} wrapper.
+    #[test]
+    fn leanfinder_results_key_extraction() {
+        let json = json!({
+            "results": [
+                {
+                    "url": "https://leanprover-community.github.io/mathlib4_docs/find/?pattern=Nat.succ#doc",
+                    "formal_statement": "def Nat.succ",
+                    "informal_statement": "Successor"
+                }
+            ]
+        });
+        let results = parse_leanfinder_results(&json);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].full_name, "Nat.succ");
+    }
+
+    /// #126: leanfinder skips URLs without pattern= (matching Python regex).
+    #[test]
+    fn leanfinder_skips_non_pattern_urls() {
+        let json = json!({
+            "results": [
+                {
+                    "url": "https://leanprover-community.github.io/mathlib4_docs/Mathlib/Foo.html",
+                    "formal_statement": "def Foo",
+                    "informal_statement": "A definition"
+                }
+            ]
+        });
+        let results = parse_leanfinder_results(&json);
+        assert!(
+            results.is_empty(),
+            "URLs without pattern= should be skipped"
+        );
+    }
+
+    /// #126: leanfinder filters by mathlib4_docs in URL.
+    #[test]
+    fn leanfinder_filters_by_url_not_corpus() {
+        let json = json!({
+            "results": [
+                {
+                    "url": "https://leanprover-community.github.io/lean4_docs/find/?pattern=True#doc",
+                    "formal_statement": "def True",
+                    "informal_statement": "The true proposition"
+                },
+                {
+                    "url": "https://leanprover-community.github.io/mathlib4_docs/find/?pattern=mul_comm#doc",
+                    "formal_statement": "theorem mul_comm",
+                    "informal_statement": "Commutativity"
+                }
+            ]
+        });
+        let results = parse_leanfinder_results(&json);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].full_name, "mul_comm");
+    }
+
+    /// #128: loogle requests include User-Agent header.
+    /// The http_client() function sets User-Agent, verified via wiremock.
+    #[tokio::test]
+    async fn loogle_sends_user_agent_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/json"))
+            .and(wiremock::matchers::header("User-Agent", "lean-lsp-mcp/0.1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "hits": [{"name": "A", "type": "T", "module": "M"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = mock_config(&server.uri());
+        let result = handle_loogle_remote("test", 8, &config).await.unwrap();
+        assert_eq!(result.items.len(), 1);
+    }
+
+    /// #128: leansearch requests include User-Agent header.
+    #[tokio::test]
+    async fn leansearch_sends_user_agent_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(wiremock::matchers::header("User-Agent", "lean-lsp-mcp/0.1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [[]]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = mock_config(&server.uri());
+        let result = handle_leansearch("query", 5, &config).await.unwrap();
+        assert!(result.items.is_empty());
+    }
+
+    /// #128: leanfinder requests include User-Agent header.
+    #[tokio::test]
+    async fn leanfinder_sends_user_agent_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("User-Agent", "lean-lsp-mcp/0.1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": []})))
+            .mount(&server)
+            .await;
+
+        let config = mock_config(&server.uri());
+        let result = handle_leanfinder("query", 5, &config).await.unwrap();
+        assert!(result.items.is_empty());
+    }
+
+    /// #126: leanfinder with top-level array (backward compatibility fallback).
+    #[test]
+    fn leanfinder_fallback_top_level_array() {
+        let json = json!([
+            {
+                "url": "https://leanprover-community.github.io/mathlib4_docs/find/?pattern=add_comm#doc",
+                "formal_statement": "theorem add_comm",
+                "informal_statement": "Addition commutes"
+            }
+        ]);
+        let results = parse_leanfinder_results(&json);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].full_name, "add_comm");
     }
 }
