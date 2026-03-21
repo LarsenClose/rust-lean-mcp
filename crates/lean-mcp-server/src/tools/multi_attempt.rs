@@ -704,7 +704,9 @@ pub async fn handle_multi_attempt_parallel(
     }
 
     // 2. Extract code up to target line (imports + context before the tactic)
-    let base_code = lines[..line as usize - 1].join("\n");
+    //    Inject maxHeartbeats to prevent runaway elaboration in isolated temp files.
+    let raw_base = lines[..line as usize - 1].join("\n");
+    let base_code = super::prepend_max_heartbeats(&raw_base);
 
     // 3. Extract target line's indentation so temp files preserve it
     let target_line = lines[(line - 1) as usize];
@@ -1554,12 +1556,13 @@ mod tests {
     #[tokio::test]
     async fn parallel_single_snippet_returns_results() {
         let dir = tempfile::TempDir::new().unwrap();
-        // goal queried at (1, 6) -- line 1 (0-indexed), col = indent(2) + len("simp")(4) = 6
+        // goal queried at (2, 6) -- line 2 (0-indexed, +1 for maxHeartbeats header),
+        // col = indent(2) + len("simp")(4) = 6
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result =
@@ -1579,12 +1582,13 @@ mod tests {
     async fn parallel_multiple_snippets() {
         let dir = tempfile::TempDir::new().unwrap();
         // goal columns: indent(2) + len("simp")(4) = 6, indent(2) + len("trivial")(7) = 9
+        // +1 line for maxHeartbeats header
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})))
-        .with_goal(1, 9, Some(json!({"goals": []})));
+        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})))
+        .with_goal(2, 9, Some(json!({"goals": []})));
 
         let snippets = vec!["simp".to_string(), "trivial".to_string()];
         let result =
@@ -1752,14 +1756,15 @@ mod tests {
     #[tokio::test]
     async fn parallel_diagnostics_captured() {
         let dir = tempfile::TempDir::new().unwrap();
+        // Diagnostic line 2 (0-indexed): +1 for maxHeartbeats header
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
         .with_diagnostics(vec![json!({
             "range": {
-                "start": {"line": 1, "character": 0},
-                "end": {"line": 1, "character": 10}
+                "start": {"line": 2, "character": 0},
+                "end": {"line": 2, "character": 10}
             },
             "severity": 1,
             "message": "unknown tactic 'bad'"
@@ -1814,12 +1819,12 @@ mod tests {
     #[tokio::test]
     async fn handle_multi_attempt_dispatches_parallel() {
         let dir = tempfile::TempDir::new().unwrap();
-        // goal column: indent(2) + len("simp")(4) = 6
+        // goal column: indent(2) + len("simp")(4) = 6, +1 line for maxHeartbeats header
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result = handle_multi_attempt(
@@ -1899,13 +1904,13 @@ mod tests {
         // Prior tactic "intro h" at line 2.
         // The snippet "simp" should be written as "  simp" in the temp file,
         // so goal_column = indent(2) + len("simp")(4) = 6.
+        // +1 line for maxHeartbeats header -> goal line 3 (0-indexed).
         let dir = tempfile::TempDir::new().unwrap();
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  intro h\n  sorry",
         )
-        // Goal at (2, 6): line 2 (0-indexed) = snippet line, col 6 = 2 indent + 4 "simp"
-        .with_goal(2, 6, Some(json!({"goals": ["h : True\n|- True"]})));
+        .with_goal(3, 6, Some(json!({"goals": ["h : True\n|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result =
@@ -1927,11 +1932,11 @@ mod tests {
     async fn parallel_indentation_empty_base_code() {
         // Edge case: sorry is the FIRST line (line 1), so base_code is empty.
         // 4-space indent on the sorry line.
+        // +1 line for maxHeartbeats header -> snippet at line 1 (0-indexed).
         let dir = tempfile::TempDir::new().unwrap();
         let client = MockParallelClient::new(dir.path().to_path_buf(), "    sorry")
-            // With empty base_code, snippet is at line 0 (0-indexed).
             // goal_column = 4 (indent) + 4 ("simp") = 8
-            .with_goal(0, 8, Some(json!({"goals": ["|- Nat"]})));
+            .with_goal(1, 8, Some(json!({"goals": ["|- Nat"]})));
 
         let snippets = vec!["simp".to_string()];
         let result =
@@ -1956,15 +1961,16 @@ mod tests {
         // The goal is queried at the LAST line of the snippet.
         // Last snippet line = "exact h" (len 7), indent = 2
         // goal_column = 2 + 7 = 9
+        // +1 line for maxHeartbeats header
         let dir = tempfile::TempDir::new().unwrap();
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        // snippet_start_line = 1 (base has 1 line: "theorem ...").
-        // Multi-line snippet has 2 lines, so last line is at 1 + 2 - 1 = line 2.
+        // snippet_start_line = 2 (base has 1 line + 1 heartbeats header).
+        // Multi-line snippet has 2 lines, so last line is at 2 + 2 - 1 = line 3.
         // goal_column = 2 + 7 = 9
-        .with_goal(2, 9, Some(json!({"goals": ["|- False"]})));
+        .with_goal(3, 9, Some(json!({"goals": ["|- False"]})));
 
         let snippets = vec!["simp\nexact h".to_string()];
         let result =
@@ -2411,7 +2417,7 @@ mod tests {
         // With 4-space indent, the sorry line should be "    sorry" not "  sorry".
         // We verify by checking diagnostics: the sorry line is at
         // snippet_start_line + snippet_line_count (0-indexed).
-        // If we set a diagnostic at that line, it should be captured.
+        // +1 for maxHeartbeats header line.
         let dir = tempfile::TempDir::new().unwrap();
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
@@ -2419,14 +2425,14 @@ mod tests {
         )
         .with_diagnostics(vec![json!({
             "range": {
-                "start": {"line": 2, "character": 0},
-                "end": {"line": 2, "character": 9}
+                "start": {"line": 3, "character": 0},
+                "end": {"line": 3, "character": 9}
             },
             "severity": 2,
             "message": "declaration uses sorry"
         })])
-        // goal at (1, 8): indent(4) + len("simp")(4) = 8
-        .with_goal(1, 8, Some(json!({"goals": ["|- True"]})));
+        // goal at (2, 8): indent(4) + len("simp")(4) = 8, +1 for heartbeats
+        .with_goal(2, 8, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result =
@@ -2741,11 +2747,12 @@ mod tests {
     #[tokio::test]
     async fn parallel_no_timeout_works_normally() {
         let dir = tempfile::TempDir::new().unwrap();
+        // +1 line for maxHeartbeats header
         let client = MockTimeoutClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result = handle_multi_attempt_parallel(
@@ -2776,11 +2783,12 @@ mod tests {
         // the mixed scenario by creating two separate calls and checking results.
         //
         // For the "fast" test, no delay:
+        // +1 line for maxHeartbeats header
         let fast_client = MockTimeoutClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
 
         let fast_snippets = vec!["simp".to_string()];
         let fast_result = handle_multi_attempt_parallel(
@@ -2833,11 +2841,12 @@ mod tests {
     #[tokio::test]
     async fn parallel_timed_out_not_in_normal_json() {
         let dir = tempfile::TempDir::new().unwrap();
+        // +1 line for maxHeartbeats header
         let client = MockTimeoutClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result = handle_multi_attempt_parallel(
