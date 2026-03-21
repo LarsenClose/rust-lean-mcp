@@ -177,65 +177,76 @@ impl LspClient for LeanLspClient {
             .await
             .map_err(|e| LspClientError::Transport(TransportError::Io(e)))?;
 
-        let mut files = self.open_files.lock().await;
+        // Prepare notification under lock, then release before sending.
+        let notification = {
+            let mut files = self.open_files.lock().await;
 
-        if let Some(state) = files.get_mut(relative_path) {
-            // File already open — check if disk content has changed
-            if disk_content != state.content {
-                state.version += 1;
-                state.content = disk_content.clone();
-
-                let params = json!({
-                    "textDocument": {
-                        "uri": path_to_uri(&self.project_path, relative_path),
-                        "version": state.version,
+            if let Some(state) = files.get_mut(relative_path) {
+                if disk_content != state.content {
+                    state.version += 1;
+                    state.content = disk_content.clone();
+                    Some((
+                        "textDocument/didChange",
+                        json!({
+                            "textDocument": {
+                                "uri": path_to_uri(&self.project_path, relative_path),
+                                "version": state.version,
+                            },
+                            "contentChanges": [{"text": disk_content}],
+                        }),
+                    ))
+                } else {
+                    None // no change needed
+                }
+            } else {
+                // First open
+                files.insert(
+                    relative_path.to_string(),
+                    FileState {
+                        version: 1,
+                        content: disk_content.clone(),
                     },
-                    "contentChanges": [{"text": disk_content}],
-                });
-                self.multiplexer
-                    .notify("textDocument/didChange", Some(params))
-                    .await
-                    .map_err(mux_err)?;
+                );
+                Some((
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": path_to_uri(&self.project_path, relative_path),
+                            "languageId": "lean4",
+                            "version": 1,
+                            "text": disk_content,
+                        }
+                    }),
+                ))
             }
-            return Ok(());
+        }; // lock released
+
+        if let Some((method, params)) = notification {
+            self.multiplexer
+                .notify(method, Some(params))
+                .await
+                .map_err(mux_err)?;
         }
-
-        // First open — send didOpen
-        let params = json!({
-            "textDocument": {
-                "uri": path_to_uri(&self.project_path, relative_path),
-                "languageId": "lean4",
-                "version": 1,
-                "text": disk_content,
-            }
-        });
-        self.multiplexer
-            .notify("textDocument/didOpen", Some(params))
-            .await
-            .map_err(mux_err)?;
-
-        files.insert(
-            relative_path.to_string(),
-            FileState {
-                version: 1,
-                content: disk_content,
-            },
-        );
         Ok(())
     }
 
     async fn open_file_force(&self, relative_path: &str) -> Result<(), LspClientError> {
-        {
+        let close_params = {
             let mut files = self.open_files.lock().await;
             if files.remove(relative_path).is_some() {
-                let params = json!({
+                Some(json!({
                     "textDocument": {"uri": path_to_uri(&self.project_path, relative_path)}
-                });
-                self.multiplexer
-                    .notify("textDocument/didClose", Some(params))
-                    .await
-                    .map_err(mux_err)?;
+                }))
+            } else {
+                None
             }
+        }; // lock released
+
+        if let Some(params) = close_params {
+            self.multiplexer
+                .notify("textDocument/didClose", Some(params))
+                .await
+                .map_err(mux_err)?;
         }
         self.open_file(relative_path).await
     }
@@ -253,19 +264,21 @@ impl LspClient for LeanLspClient {
         relative_path: &str,
         changes: Vec<Value>,
     ) -> Result<(), LspClientError> {
-        let mut files = self.open_files.lock().await;
-        let state = files
-            .get_mut(relative_path)
-            .ok_or_else(|| LspClientError::FileNotOpen(relative_path.to_string()))?;
-        state.version += 1;
+        let params = {
+            let mut files = self.open_files.lock().await;
+            let state = files
+                .get_mut(relative_path)
+                .ok_or_else(|| LspClientError::FileNotOpen(relative_path.to_string()))?;
+            state.version += 1;
+            json!({
+                "textDocument": {
+                    "uri": path_to_uri(&self.project_path, relative_path),
+                    "version": state.version,
+                },
+                "contentChanges": changes,
+            })
+        }; // lock released
 
-        let params = json!({
-            "textDocument": {
-                "uri": path_to_uri(&self.project_path, relative_path),
-                "version": state.version,
-            },
-            "contentChanges": changes,
-        });
         self.multiplexer
             .notify("textDocument/didChange", Some(params))
             .await
@@ -278,20 +291,22 @@ impl LspClient for LeanLspClient {
         relative_path: &str,
         content: &str,
     ) -> Result<(), LspClientError> {
-        let mut files = self.open_files.lock().await;
-        let state = files
-            .get_mut(relative_path)
-            .ok_or_else(|| LspClientError::FileNotOpen(relative_path.to_string()))?;
-        state.version += 1;
-        state.content = content.to_string();
+        let params = {
+            let mut files = self.open_files.lock().await;
+            let state = files
+                .get_mut(relative_path)
+                .ok_or_else(|| LspClientError::FileNotOpen(relative_path.to_string()))?;
+            state.version += 1;
+            state.content = content.to_string();
+            json!({
+                "textDocument": {
+                    "uri": path_to_uri(&self.project_path, relative_path),
+                    "version": state.version,
+                },
+                "contentChanges": [{"text": content}],
+            })
+        }; // lock released
 
-        let params = json!({
-            "textDocument": {
-                "uri": path_to_uri(&self.project_path, relative_path),
-                "version": state.version,
-            },
-            "contentChanges": [{"text": content}],
-        });
         self.multiplexer
             .notify("textDocument/didChange", Some(params))
             .await
@@ -300,17 +315,25 @@ impl LspClient for LeanLspClient {
     }
 
     async fn close_files(&self, paths: &[String]) -> Result<(), LspClientError> {
-        let mut files = self.open_files.lock().await;
-        for path in paths {
-            if files.remove(path).is_some() {
-                let params = json!({
-                    "textDocument": {"uri": path_to_uri(&self.project_path, path)}
-                });
-                self.multiplexer
-                    .notify("textDocument/didClose", Some(params))
-                    .await
-                    .map_err(mux_err)?;
+        // Collect notifications under lock, then send after releasing.
+        let notifications = {
+            let mut files = self.open_files.lock().await;
+            let mut notifs = Vec::new();
+            for path in paths {
+                if files.remove(path).is_some() {
+                    notifs.push(json!({
+                        "textDocument": {"uri": path_to_uri(&self.project_path, path)}
+                    }));
+                }
             }
+            notifs
+        }; // lock released
+
+        for params in notifications {
+            self.multiplexer
+                .notify("textDocument/didClose", Some(params))
+                .await
+                .map_err(mux_err)?;
         }
         Ok(())
     }

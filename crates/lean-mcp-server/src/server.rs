@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use lean_lsp_client::client::LspClient;
 use lean_lsp_client::lean_client::LeanLspClient;
+use lean_lsp_client::pool::LspClientPool;
 use lean_mcp_core::instructions::INSTRUCTIONS;
 use lean_mcp_core::models::AttemptResult;
 use lean_mcp_core::task_manager::TaskManager;
@@ -340,8 +341,8 @@ pub struct TaskResultParams {
 pub struct AppContext {
     /// Explicit project path from CLI/env (takes precedence over detection).
     explicit_project_path: Option<PathBuf>,
-    /// Per-project LSP clients, keyed by canonicalized project root.
-    clients: Arc<tokio::sync::RwLock<HashMap<PathBuf, Arc<dyn LspClient>>>>,
+    /// Per-project LSP client pools, keyed by canonicalized project root.
+    clients: Arc<tokio::sync::RwLock<HashMap<PathBuf, Arc<LspClientPool>>>>,
     /// Cached CWD-based project detection result.
     cwd_project: Arc<OnceLock<Option<PathBuf>>>,
     /// Search endpoint configuration (URLs for leansearch, loogle, etc.).
@@ -429,23 +430,23 @@ impl AppContext {
         )
     }
 
-    /// Get or create an LSP client for a specific project.
-    async fn ensure_client_for(&self, project_path: &Path) -> Result<Arc<dyn LspClient>, String> {
+    /// Get or create an LSP client pool for a specific project.
+    async fn ensure_client_for(&self, project_path: &Path) -> Result<Arc<LspClientPool>, String> {
         // Fast path: read lock
         {
             let clients = self.clients.read().await;
-            if let Some(client) = clients.get(project_path) {
-                return Ok(client.clone());
+            if let Some(pool) = clients.get(project_path) {
+                return Ok(pool.clone());
             }
         }
         // Slow path: write lock with double-check
         let mut clients = self.clients.write().await;
-        if let Some(client) = clients.get(project_path) {
-            return Ok(client.clone());
+        if let Some(pool) = clients.get(project_path) {
+            return Ok(pool.clone());
         }
-        let client = spawn_lsp_client(project_path.to_path_buf()).await?;
-        clients.insert(project_path.to_path_buf(), client.clone());
-        Ok(client)
+        let pool = spawn_lsp_pool(project_path.to_path_buf()).await?;
+        clients.insert(project_path.to_path_buf(), pool.clone());
+        Ok(pool)
     }
 
     /// Evict and shut down the LSP client for a project.
@@ -463,13 +464,13 @@ impl AppContext {
     }
 
     /// Convenience: resolve project from file_path, then get client.
-    async fn client_for_file(&self, file_path: &str) -> Result<Arc<dyn LspClient>, String> {
+    async fn client_for_file(&self, file_path: &str) -> Result<Arc<LspClientPool>, String> {
         let project_path = self.resolve_project_path(Some(file_path))?;
         self.ensure_client_for(&project_path).await
     }
 
     /// Convenience: resolve default project, then get client (for tools without file_path).
-    async fn client_default(&self) -> Result<Arc<dyn LspClient>, String> {
+    async fn client_default(&self) -> Result<Arc<LspClientPool>, String> {
         let project_path = self.resolve_project_path(None)?;
         self.ensure_client_for(&project_path).await
     }
@@ -515,6 +516,91 @@ async fn spawn_lsp_client(project_path: PathBuf) -> Result<Arc<dyn LspClient>, S
 
     tracing::info!("LSP client connected");
     Ok(Arc::new(client) as Arc<dyn LspClient>)
+}
+
+/// Spawn an auto-scaling pool of `lake serve` instances for a project.
+///
+/// Starts with a single instance and grows on demand up to [`compute_max_instances`].
+async fn spawn_lsp_pool(project_path: PathBuf) -> Result<Arc<LspClientPool>, String> {
+    let max = compute_max_instances();
+    tracing::info!(
+        "Creating LSP pool for {} (max {max} instances)",
+        project_path.display()
+    );
+
+    let initial = spawn_lsp_client(project_path.clone()).await?;
+
+    let pp = project_path.clone();
+    let spawner: lean_lsp_client::pool::ClientSpawner = Box::new(move || {
+        let pp = pp.clone();
+        Box::pin(async move { spawn_lsp_client(pp).await })
+    });
+
+    let pool = LspClientPool::new(project_path, initial, max, spawner);
+    Ok(Arc::new(pool))
+}
+
+/// Compute the maximum number of LSP instances based on system resources.
+///
+/// Uses CPU count and available memory. Can be overridden via
+/// `LEAN_MCP_MAX_INSTANCES` environment variable.
+fn compute_max_instances() -> usize {
+    // Check env override first
+    if let Ok(val) = std::env::var("LEAN_MCP_MAX_INSTANCES") {
+        if let Ok(n) = val.parse::<usize>() {
+            if n >= 1 {
+                tracing::info!("LEAN_MCP_MAX_INSTANCES override: {n}");
+                return n;
+            }
+        }
+    }
+
+    // CPU-based cap: half of available parallelism
+    let cpu_cap = std::thread::available_parallelism()
+        .map(|p| p.get() / 2)
+        .unwrap_or(2)
+        .max(1);
+
+    // Memory-based cap: ~2 GB per lake serve instance
+    let mem_cap = available_memory_gb()
+        .map(|gb| (gb / 2.0) as usize)
+        .unwrap_or(4)
+        .max(1);
+
+    let cap = cpu_cap.min(mem_cap).clamp(1, 8);
+    tracing::info!("Auto-computed max LSP instances: {cap} (cpu_cap={cpu_cap}, mem_cap={mem_cap})");
+    cap
+}
+
+/// Best-effort detection of available system memory in GB.
+#[cfg(target_os = "macos")]
+fn available_memory_gb() -> Option<f64> {
+    let output = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("hw.memsize")
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout);
+    let bytes: u64 = s.trim().parse().ok()?;
+    Some(bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+#[cfg(target_os = "linux")]
+fn available_memory_gb() -> Option<f64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb_str = rest.trim().trim_end_matches("kB").trim();
+            let kb: u64 = kb_str.parse().ok()?;
+            return Some(kb as f64 / (1024.0 * 1024.0));
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn available_memory_gb() -> Option<f64> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +698,7 @@ impl AppContext {
         };
         tools::project_health::handle_project_health(
             &project_path,
-            client.as_ref().map(|c| c.as_ref()),
+            client.as_ref().map(|c| c.as_ref() as &dyn LspClient),
             include_goals,
         )
         .await
@@ -732,7 +818,7 @@ impl AppContext {
         };
         let result = tools::batch::handle_batch(
             params.calls,
-            client.as_ref().map(|c| c.as_ref()),
+            client.as_ref().map(|c| c.as_ref() as &dyn LspClient),
             project_path.as_deref(),
             &self.search_config,
         )
@@ -1349,10 +1435,14 @@ impl AppContext {
         let clients = self.clients.read().await;
         let mut sessions = Vec::new();
 
-        for (path, _client) in clients.iter() {
+        for (path, pool) in clients.iter() {
             sessions.push(serde_json::json!({
                 "project_path": path.to_string_lossy(),
                 "status": "active",
+                "pool_size": pool.instance_count().await,
+                "max_pool_size": pool.max_instances(),
+                "in_flight": pool.in_flight_counts().await,
+                "affinity_entries": pool.affinity_entry_count().await,
             }));
         }
         drop(clients);
