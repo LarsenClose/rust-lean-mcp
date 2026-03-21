@@ -72,8 +72,9 @@ pub async fn handle_run_code(
     let abs_path = mcp_dir.join(&filename);
     let rel_path = format!(".lake/_mcp/{filename}");
 
-    // 2. Write code to the temp file.
-    std::fs::write(&abs_path, code)
+    // 2. Inject maxHeartbeats to prevent runaway elaboration, then write.
+    let code_with_heartbeats = super::prepend_max_heartbeats(code);
+    std::fs::write(&abs_path, &code_with_heartbeats)
         .map_err(|e| LeanToolError::Other(format!("Error writing code snippet: {e}")))?;
 
     // 3. Open in LSP, get diagnostics -- always clean up afterwards.
