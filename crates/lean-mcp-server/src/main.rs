@@ -10,8 +10,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() {
     // Initialize tracing (respects RUST_LOG env var).
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Optional file-based tracing for performance analysis.
     // Set LEAN_MCP_LOG=/tmp/rust-lean-mcp.log to enable.
@@ -31,8 +30,7 @@ async fn main() {
             .with_target(true)
             .with_ansi(false);
 
-        let stderr_layer = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr);
+        let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
         tracing_subscriber::registry()
             .with(env_filter)
