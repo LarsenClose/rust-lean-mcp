@@ -142,6 +142,8 @@ impl Multiplexer {
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, MultiplexerError> {
+        let request_start = std::time::Instant::now();
+
         // 1. Allocate next request ID.
         let numeric_id = {
             let mut next = self.next_id.lock().await;
@@ -165,7 +167,7 @@ impl Multiplexer {
         let msg_value = serde_json::to_value(&request)
             .map_err(|e| MultiplexerError::Transport(TransportError::Json(e)))?;
 
-        debug!(%id, method, "Sending request");
+        debug!(%id, method, "lsp_request");
 
         self.outgoing_tx
             .send(msg_value)
@@ -174,12 +176,19 @@ impl Multiplexer {
 
         // 5. Wait on oneshot receiver (with timeout).
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(value)) => Ok(value),
+            Ok(Ok(value)) => {
+                let elapsed_ms = request_start.elapsed().as_millis();
+                debug!(%id, method, elapsed_ms, "lsp_response");
+                Ok(value)
+            }
             Ok(Err(_)) => {
-                // Sender was dropped (e.g., multiplexer shut down).
+                let elapsed_ms = request_start.elapsed().as_millis();
+                warn!(%id, method, elapsed_ms, "lsp_shutdown");
                 Err(MultiplexerError::Shutdown)
             }
             Err(_) => {
+                let elapsed_ms = request_start.elapsed().as_millis();
+                warn!(%id, method, elapsed_ms, "lsp_timeout");
                 // Timeout: remove from pending map.
                 let mut pending = self.pending.lock().await;
                 pending.remove(&id);
