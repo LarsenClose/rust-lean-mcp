@@ -1,7 +1,7 @@
 //! Real LSP client implementation connecting the [`LspClient`] trait to a
 //! [`Multiplexer`] for communication with a Lean 4 LSP server.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex, Notify};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::client::{path_to_uri, LspClient, LspClientError};
 use crate::error::TransportError;
@@ -87,6 +87,10 @@ pub struct LeanLspClient {
     elaboration_states: Arc<std::sync::Mutex<HashMap<String, ElaborationState>>>,
     /// Signaled when elaboration state changes (fileProgress or diagnostics).
     elaboration_notify: Arc<Notify>,
+    /// Tracks files for which a dependency rebuild (force-reopen) has already
+    /// been attempted after encountering "Imports are out of date" diagnostics.
+    /// Prevents infinite retry loops — each file is retried at most once.
+    dependency_rebuild_attempted: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 /// Convert a [`MultiplexerError`] to an [`LspClientError`].
@@ -250,6 +254,7 @@ impl LeanLspClient {
             diag_rx: Arc::new(Mutex::new(diag_rx)),
             elaboration_states,
             elaboration_notify,
+            dependency_rebuild_attempted: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
 
@@ -646,6 +651,45 @@ impl LspClient for LeanLspClient {
             let map = self.diagnostics.lock().unwrap();
             map.get(&uri).cloned().unwrap_or_default()
         };
+
+        // Check for "Imports are out of date" error diagnostics.
+        // If found and not already attempted for this file, force-reopen
+        // the file and re-collect diagnostics.
+        let has_stale_imports = all_diags.iter().any(|d| {
+            d.get("severity").and_then(|s| s.as_u64()) == Some(1) // error
+                && d.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m.contains("Imports are out of date"))
+                    .unwrap_or(false)
+        });
+
+        if has_stale_imports {
+            let already_attempted = {
+                let set = self.dependency_rebuild_attempted.lock().unwrap();
+                set.contains(relative_path)
+            };
+
+            if !already_attempted {
+                {
+                    let mut set = self.dependency_rebuild_attempted.lock().unwrap();
+                    set.insert(relative_path.to_string());
+                }
+
+                warn!(
+                    file = relative_path,
+                    "Stale imports detected, force-reopening file to rebuild dependencies"
+                );
+
+                // Force-reopen the file (close + reopen from disk).
+                self.open_file_force(relative_path).await?;
+
+                // Re-run diagnostics with the full triple-signal waiting.
+                // The rebuild flag prevents infinite recursion.
+                return self
+                    .get_diagnostics(relative_path, start_line, end_line, inactivity_timeout)
+                    .await;
+            }
+        }
 
         let filtered: Vec<Value> = if start_line.is_some() || end_line.is_some() {
             let start = start_line.unwrap_or(0);
@@ -1990,5 +2034,360 @@ mod tests {
         assert_eq!(diags.len(), 2);
 
         server.await.unwrap();
+    }
+
+    // ── Stale imports auto-rebuild ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_stale_imports_triggers_force_reopen() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "Stale.lean", "import Mathlib").await;
+
+        let uri = path_to_uri(client.project_path(), "Stale.lean");
+
+        // Send diagnostics with "Imports are out of date" error.
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri,
+                "diagnostics": [{
+                    "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":16}},
+                    "message": "Imports are out of date and must be rebuilt; use the \"Restart File\" command in your editor.",
+                    "severity": 1
+                }]
+            }
+        });
+        write_message(&mut sw, &notif).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // get_diagnostics should detect stale imports and force-reopen.
+        // The force-reopen sends didClose then didOpen. We need to drain
+        // those messages and send fresh diagnostics.
+        let diag_fut = client.get_diagnostics("Stale.lean", None, None, Some(0.2));
+
+        let server_fut = async {
+            // First waitForDiagnostics RPC from initial get_diagnostics call.
+            let wfd1 = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd1["method"], "textDocument/waitForDiagnostics");
+            let wfd1_id = wfd1["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd1_id,"result":{}}))
+                .await
+                .unwrap();
+
+            // Expect didClose from force-reopen
+            let close_msg = read_message(&mut sr).await.unwrap();
+            assert_eq!(close_msg["method"], "textDocument/didClose");
+
+            // Expect didOpen from force-reopen
+            let open_msg = read_message(&mut sr).await.unwrap();
+            assert_eq!(open_msg["method"], "textDocument/didOpen");
+
+            // Second waitForDiagnostics RPC from recursive get_diagnostics call.
+            let wfd2 = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd2["method"], "textDocument/waitForDiagnostics");
+            let wfd2_id = wfd2["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd2_id,"result":{}}))
+                .await
+                .unwrap();
+
+            // Send fresh diagnostics (no stale imports error this time)
+            let fresh_notif = json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": uri,
+                    "diagnostics": [{
+                        "range": {"start":{"line":5,"character":0},"end":{"line":5,"character":10}},
+                        "message": "type mismatch",
+                        "severity": 1
+                    }]
+                }
+            });
+            write_message(&mut sw, &fresh_notif).await.unwrap();
+        };
+
+        let (result, _) = tokio::join!(diag_fut, server_fut);
+        let result = result.unwrap();
+        let diags = result.as_array().unwrap();
+        // Should return the fresh diagnostics, not the stale imports error.
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["message"], "type mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_stale_imports_rebuild_only_attempted_once() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "Once.lean", "import Mathlib").await;
+
+        let uri = path_to_uri(client.project_path(), "Once.lean");
+
+        // First call: send stale imports diagnostic.
+        let stale_notif = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri,
+                "diagnostics": [{
+                    "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":16}},
+                    "message": "Imports are out of date and must be rebuilt",
+                    "severity": 1
+                }]
+            }
+        });
+        write_message(&mut sw, &stale_notif).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // First get_diagnostics — should trigger rebuild.
+        let diag_fut = client.get_diagnostics("Once.lean", None, None, Some(0.2));
+        let server_fut = async {
+            // First waitForDiagnostics RPC from initial get_diagnostics call.
+            let wfd1 = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd1["method"], "textDocument/waitForDiagnostics");
+            let wfd1_id = wfd1["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd1_id,"result":{}}))
+                .await
+                .unwrap();
+
+            let close_msg = read_message(&mut sr).await.unwrap();
+            assert_eq!(close_msg["method"], "textDocument/didClose");
+            let open_msg = read_message(&mut sr).await.unwrap();
+            assert_eq!(open_msg["method"], "textDocument/didOpen");
+
+            // Second waitForDiagnostics RPC from recursive get_diagnostics call.
+            let wfd2 = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd2["method"], "textDocument/waitForDiagnostics");
+            let wfd2_id = wfd2["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd2_id,"result":{}}))
+                .await
+                .unwrap();
+
+            // Still send stale imports (simulating rebuild didn't fix it)
+            let notif = json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": uri,
+                    "diagnostics": [{
+                        "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":16}},
+                        "message": "Imports are out of date and must be rebuilt",
+                        "severity": 1
+                    }]
+                }
+            });
+            write_message(&mut sw, &notif).await.unwrap();
+        };
+        let (result, _) = tokio::join!(diag_fut, server_fut);
+        result.unwrap();
+
+        // Second call: send stale imports again. Should NOT trigger rebuild.
+        let stale_notif2 = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri,
+                "diagnostics": [{
+                    "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":16}},
+                    "message": "Imports are out of date and must be rebuilt",
+                    "severity": 1
+                }]
+            }
+        });
+        write_message(&mut sw, &stale_notif2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Second get_diagnostics sends a waitForDiagnostics RPC but no rebuild.
+        let diag_fut2 = client.get_diagnostics("Once.lean", None, None, Some(0.2));
+        let server_fut2 = async {
+            // Handle waitForDiagnostics from second get_diagnostics call.
+            let wfd3 = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd3["method"], "textDocument/waitForDiagnostics");
+            let wfd3_id = wfd3["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd3_id,"result":{}}))
+                .await
+                .unwrap();
+        };
+        let (result2, _) = tokio::join!(diag_fut2, server_fut2);
+        let result2 = result2.unwrap();
+
+        // Should return the stale imports error as-is (no rebuild attempted)
+        let diags = result2.as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Imports are out of date"));
+
+        // Verify no didClose/didOpen was sent (would cause server read to block)
+        let read_result =
+            tokio::time::timeout(Duration::from_millis(100), read_message(&mut sr)).await;
+        assert!(
+            read_result.is_err(),
+            "Expected no message but got one — rebuild was attempted twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_normal_diagnostics_no_rebuild() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "Normal.lean", "def x := sorry").await;
+
+        let uri = path_to_uri(client.project_path(), "Normal.lean");
+
+        // Send normal error diagnostics (NOT stale imports).
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri,
+                "diagnostics": [{
+                    "range": {"start":{"line":0,"character":9},"end":{"line":0,"character":14}},
+                    "message": "declaration uses 'sorry'",
+                    "severity": 2
+                }]
+            }
+        });
+        write_message(&mut sw, &notif).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // get_diagnostics sends a waitForDiagnostics RPC in the background.
+        let diag_fut = client.get_diagnostics("Normal.lean", None, None, Some(0.1));
+        let server_fut = async {
+            // Handle the waitForDiagnostics request.
+            let wfd = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd["method"], "textDocument/waitForDiagnostics");
+            let wfd_id = wfd["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd_id,"result":{}}))
+                .await
+                .unwrap();
+        };
+        let (result, _) = tokio::join!(diag_fut, server_fut);
+        let result = result.unwrap();
+        let diags = result.as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["message"], "declaration uses 'sorry'");
+
+        // Verify no didClose/didOpen was sent — no rebuild for normal diagnostics
+        let read_result =
+            tokio::time::timeout(Duration::from_millis(100), read_message(&mut sr)).await;
+        assert!(
+            read_result.is_err(),
+            "Expected no message but got one — rebuild triggered for normal diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_imports_different_files_tracked_separately() {
+        let (client, mut sr, mut sw, dir) = setup().await;
+        open_test_file(&client, &mut sr, &dir, "A.lean", "import X").await;
+        open_test_file(&client, &mut sr, &dir, "B.lean", "import Y").await;
+
+        let uri_a = path_to_uri(client.project_path(), "A.lean");
+        let uri_b = path_to_uri(client.project_path(), "B.lean");
+
+        // Trigger stale imports on A.lean
+        let notif_a = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri_a,
+                "diagnostics": [{
+                    "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":8}},
+                    "message": "Imports are out of date",
+                    "severity": 1
+                }]
+            }
+        });
+        write_message(&mut sw, &notif_a).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // get_diagnostics for A should trigger rebuild
+        let diag_fut = client.get_diagnostics("A.lean", None, None, Some(0.2));
+        let server_fut = async {
+            // First waitForDiagnostics RPC from initial get_diagnostics for A.
+            let wfd1 = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd1["method"], "textDocument/waitForDiagnostics");
+            let wfd1_id = wfd1["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd1_id,"result":{}}))
+                .await
+                .unwrap();
+
+            let close_msg = read_message(&mut sr).await.unwrap();
+            assert_eq!(close_msg["method"], "textDocument/didClose");
+            let open_msg = read_message(&mut sr).await.unwrap();
+            assert_eq!(open_msg["method"], "textDocument/didOpen");
+
+            // Second waitForDiagnostics RPC from recursive get_diagnostics for A.
+            let wfd2 = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd2["method"], "textDocument/waitForDiagnostics");
+            let wfd2_id = wfd2["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd2_id,"result":{}}))
+                .await
+                .unwrap();
+
+            let fresh = json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": { "uri": uri_a, "diagnostics": [] }
+            });
+            write_message(&mut sw, &fresh).await.unwrap();
+        };
+        let (result, _) = tokio::join!(diag_fut, server_fut);
+        result.unwrap();
+
+        // Now trigger stale imports on B.lean — should still trigger rebuild
+        // because B.lean hasn't been attempted yet.
+        let notif_b = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri_b,
+                "diagnostics": [{
+                    "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":8}},
+                    "message": "Imports are out of date",
+                    "severity": 1
+                }]
+            }
+        });
+        write_message(&mut sw, &notif_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let diag_fut = client.get_diagnostics("B.lean", None, None, Some(0.2));
+        let server_fut = async {
+            // First waitForDiagnostics RPC from initial get_diagnostics for B.
+            let wfd3 = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd3["method"], "textDocument/waitForDiagnostics");
+            let wfd3_id = wfd3["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd3_id,"result":{}}))
+                .await
+                .unwrap();
+
+            let close_msg = read_message(&mut sr).await.unwrap();
+            assert_eq!(close_msg["method"], "textDocument/didClose");
+            let open_msg = read_message(&mut sr).await.unwrap();
+            assert_eq!(open_msg["method"], "textDocument/didOpen");
+
+            // Second waitForDiagnostics RPC from recursive get_diagnostics for B.
+            let wfd4 = read_message(&mut sr).await.unwrap();
+            assert_eq!(wfd4["method"], "textDocument/waitForDiagnostics");
+            let wfd4_id = wfd4["id"].as_i64().unwrap();
+            write_message(&mut sw, &json!({"jsonrpc":"2.0","id":wfd4_id,"result":{}}))
+                .await
+                .unwrap();
+
+            let fresh = json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": { "uri": uri_b, "diagnostics": [] }
+            });
+            write_message(&mut sw, &fresh).await.unwrap();
+        };
+        let (result, _) = tokio::join!(diag_fut, server_fut);
+        let result = result.unwrap();
+        let diags = result.as_array().unwrap();
+        assert!(
+            diags.is_empty(),
+            "B.lean should have clean diagnostics after rebuild"
+        );
     }
 }
