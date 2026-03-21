@@ -134,10 +134,24 @@ impl LspClientPool {
                     let load = inst.in_flight.load(Ordering::Relaxed);
                     if load < SATURATION_THRESHOLD {
                         inst.in_flight.fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            routing = "affinity_hit",
+                            instance = idx,
+                            load,
+                            file = path,
+                            "pool_acquire"
+                        );
                         return Ok(InstanceGuard {
                             instance: inst.clone(),
                         });
                     }
+                    debug!(
+                        routing = "affinity_saturated",
+                        instance = idx,
+                        load,
+                        file = path,
+                        "pool_acquire"
+                    );
                 }
             }
         }
@@ -149,6 +163,14 @@ impl LspClientPool {
             .min_by_key(|(_, inst)| inst.in_flight.load(Ordering::Relaxed))
             .map(|(i, inst)| (i, inst.in_flight.load(Ordering::Relaxed)))
             .expect("pool must have at least one instance");
+
+        debug!(
+            routing = "least_loaded",
+            instance = idx,
+            load = min_load,
+            pool_size = instances.len(),
+            "pool_acquire"
+        );
 
         instances[idx].in_flight.fetch_add(1, Ordering::Relaxed);
         let guard = InstanceGuard {

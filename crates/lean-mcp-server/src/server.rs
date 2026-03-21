@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lean_lsp_client::client::LspClient;
 use lean_lsp_client::lean_client::LeanLspClient;
@@ -328,6 +328,33 @@ pub struct TaskResultParams {
 }
 
 // ---------------------------------------------------------------------------
+// Performance tracing
+// ---------------------------------------------------------------------------
+
+/// Drop guard that logs tool call duration on drop.
+struct ToolTimer {
+    tool: &'static str,
+    start: Instant,
+}
+
+impl ToolTimer {
+    fn new(tool: &'static str) -> Self {
+        tracing::info!(tool, "tool_call");
+        Self {
+            tool,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ToolTimer {
+    fn drop(&mut self) {
+        let elapsed_ms = self.start.elapsed().as_millis();
+        tracing::info!(tool = self.tool, elapsed_ms, "tool_complete");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AppContext
 // ---------------------------------------------------------------------------
 
@@ -396,6 +423,7 @@ impl AppContext {
     /// 2. Auto-detect from file_path (walk up looking for project markers)
     /// 3. Auto-detect from CWD (cached)
     /// 4. Error
+    #[tracing::instrument(skip(self), level = "debug")]
     pub fn resolve_project_path(&self, file_path: Option<&str>) -> Result<PathBuf, String> {
         // 1. Explicit path
         if let Some(ref pp) = self.explicit_project_path {
@@ -431,6 +459,7 @@ impl AppContext {
     }
 
     /// Get or create an LSP client pool for a specific project.
+    #[tracing::instrument(skip(self), level = "debug")]
     async fn ensure_client_for(&self, project_path: &Path) -> Result<Arc<LspClientPool>, String> {
         // Fast path: read lock
         {
@@ -464,6 +493,7 @@ impl AppContext {
     }
 
     /// Convenience: resolve project from file_path, then get client.
+    #[tracing::instrument(skip(self), level = "debug")]
     async fn client_for_file(&self, file_path: &str) -> Result<Arc<LspClientPool>, String> {
         let project_path = self.resolve_project_path(Some(file_path))?;
         self.ensure_client_for(&project_path).await
@@ -658,6 +688,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<BuildParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_build");
         let project_path = self.resolve_project_path(None)?;
 
         // Shut down the old LSP client before building so it doesn't hold
@@ -689,6 +720,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<ProjectHealthParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_project_health");
         let project_path = self.resolve_project_path(None)?;
         let include_goals = params.include_goals.unwrap_or(false);
         let client = if include_goals {
@@ -715,6 +747,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<FileOutlineParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_file_outline");
         let client = self.client_for_file(&params.file_path).await?;
         tools::outline::handle_file_outline(
             client.as_ref(),
@@ -736,6 +769,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<DiagnosticParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_diagnostic_messages");
         let client = self.client_for_file(&params.file_path).await?;
         let project_path = self.resolve_project_path(Some(&params.file_path))?;
         tools::diagnostics::handle_diagnostics(
@@ -763,6 +797,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<GoalParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_goal");
         let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
             client.as_ref(),
@@ -787,6 +822,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<ProofDiffParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_proof_diff");
         let client = self.client_for_file(&params.file_path).await?;
         tools::proof_diff::handle_lean_proof_diff(
             client.as_ref(),
@@ -811,6 +847,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<BatchParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_batch");
         let project_path = self.resolve_project_path(None).ok();
         let client = match &project_path {
             Some(pp) => self.ensure_client_for(pp).await.ok(),
@@ -836,6 +873,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<TermGoalParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_term_goal");
         let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
             client.as_ref(),
@@ -860,6 +898,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<HoverParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_hover_info");
         let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
             client.as_ref(),
@@ -884,6 +923,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<CompletionsParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_completions");
         let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
             client.as_ref(),
@@ -914,6 +954,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<DeclarationParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_declaration_file");
         let client = self.client_for_file(&params.file_path).await?;
         tools::declarations::handle_declaration_file(
             client.as_ref(),
@@ -935,6 +976,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<ReferencesParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_references");
         let client = self.client_for_file(&params.file_path).await?;
         let line = resolve_line(
             client.as_ref(),
@@ -964,6 +1006,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<MultiAttemptParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_multi_attempt");
         let client = self.client_for_file(&params.file_path).await?;
         tools::multi_attempt::handle_multi_attempt(
             client.as_ref(),
@@ -990,6 +1033,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<MultiAttemptAsyncParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_multi_attempt_async");
         let client = self.client_for_file(&params.file_path).await?;
 
         // Ensure file is open before reading content (#90)
@@ -1124,6 +1168,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<RunCodeParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_run_code");
         let project_path = self.resolve_project_path(None)?;
         let client = self.ensure_client_for(&project_path).await?;
         tools::run_code::handle_run_code(client.as_ref(), &project_path, &params.code)
@@ -1142,6 +1187,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<VerifyParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_verify");
         let client = self.client_for_file(&params.file_path).await?;
         tools::verify::handle_verify(
             client.as_ref(),
@@ -1164,6 +1210,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<LocalSearchParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_local_search");
         let root = match params.project_root {
             Some(r) => PathBuf::from(r),
             None => self.resolve_project_path(None)?,
@@ -1187,6 +1234,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<LeanSearchParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_leansearch");
         tools::search::handle_leansearch(
             &params.query,
             params.num_results.unwrap_or(5),
@@ -1207,6 +1255,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<LoogleParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_loogle");
         tools::search::handle_loogle_remote(
             &params.query,
             params.num_results.unwrap_or(8),
@@ -1227,6 +1276,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<LeanFinderParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_leanfinder");
         tools::search::handle_leanfinder(
             &params.query,
             params.num_results.unwrap_or(5),
@@ -1247,6 +1297,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<StateSearchParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_state_search");
         let client = self.client_for_file(&params.file_path).await?;
         tools::search::handle_state_search(
             client.as_ref(),
@@ -1271,6 +1322,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<HammerPremiseParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_hammer_premise");
         let client = self.client_for_file(&params.file_path).await?;
         tools::search::handle_hammer_premise(
             client.as_ref(),
@@ -1295,6 +1347,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<CodeActionsParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_code_actions");
         let client = self.client_for_file(&params.file_path).await?;
         tools::code_actions::handle_code_actions(client.as_ref(), &params.file_path, params.line)
             .await
@@ -1312,6 +1365,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<GetWidgetsParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_get_widgets");
         let client = self.client_for_file(&params.file_path).await?;
         tools::widgets::handle_get_widgets(
             client.as_ref(),
@@ -1332,6 +1386,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<WidgetSourceParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_get_widget_source");
         let client = self.client_for_file(&params.file_path).await?;
         tools::widgets::handle_get_widget_source(
             client.as_ref(),
@@ -1353,6 +1408,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<ProfileProofParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_profile_proof");
         let project_path = self.resolve_project_path(Some(&params.file_path))?;
         let file = PathBuf::from(&params.file_path);
         tools::profile::handle_profile_proof(
@@ -1377,6 +1433,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<BatchGoalParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_goals_batch");
         let client = self.client_default().await?;
         tools::batch_goals::handle_lean_goals_batch(client.as_ref(), params.positions)
             .await
@@ -1394,6 +1451,7 @@ impl AppContext {
         &self,
         Parameters(params): Parameters<TaskResultParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_task_result");
         // Handle cancellation
         if params.cancel == Some(true) {
             let cancelled = self.task_manager.cancel_task(&params.task_id).await;
@@ -1432,6 +1490,7 @@ impl AppContext {
         &self,
         Parameters(_params): Parameters<ServerHealthParams>,
     ) -> Result<String, String> {
+        let _t = ToolTimer::new("lean_server_health");
         let clients = self.clients.read().await;
         let mut sessions = Vec::new();
 
