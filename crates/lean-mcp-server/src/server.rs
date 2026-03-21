@@ -517,12 +517,27 @@ impl Default for AppContext {
     }
 }
 
+/// Resolve the per-instance thread count from `LEAN_MCP_THREADS_PER_INSTANCE`.
+///
+/// Falls back to `"4"` when the variable is unset or empty.
+fn threads_per_instance() -> String {
+    std::env::var("LEAN_MCP_THREADS_PER_INSTANCE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "4".to_string())
+}
+
 /// Spawn `lake serve` and create a connected [`LeanLspClient`].
 async fn spawn_lsp_client(project_path: PathBuf) -> Result<Arc<dyn LspClient>, String> {
-    tracing::info!("Spawning `lake serve` in {}", project_path.display());
+    let num_threads = threads_per_instance();
+    tracing::info!(
+        "Spawning `lake serve` in {} with LEAN_NUM_THREADS={num_threads}",
+        project_path.display()
+    );
 
     let mut child = Command::new("lake")
         .arg("serve")
+        .env("LEAN_NUM_THREADS", &num_threads)
         .current_dir(&project_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2011,5 +2026,31 @@ mod tests {
         assert!(!version.is_empty(), "server_version should be non-empty");
         // Should match the compile-time version
         assert_eq!(version, server_version());
+    }
+
+    // ---- threads_per_instance tests ----
+
+    #[test]
+    fn threads_per_instance_default_is_four() {
+        // Remove the env var if set, then check the default
+        std::env::remove_var("LEAN_MCP_THREADS_PER_INSTANCE");
+        assert_eq!(threads_per_instance(), "4");
+    }
+
+    #[test]
+    fn threads_per_instance_respects_env_var() {
+        std::env::set_var("LEAN_MCP_THREADS_PER_INSTANCE", "8");
+        let result = threads_per_instance();
+        // Clean up before asserting so other tests aren't affected
+        std::env::remove_var("LEAN_MCP_THREADS_PER_INSTANCE");
+        assert_eq!(result, "8");
+    }
+
+    #[test]
+    fn threads_per_instance_ignores_empty_value() {
+        std::env::set_var("LEAN_MCP_THREADS_PER_INSTANCE", "");
+        let result = threads_per_instance();
+        std::env::remove_var("LEAN_MCP_THREADS_PER_INSTANCE");
+        assert_eq!(result, "4");
     }
 }
