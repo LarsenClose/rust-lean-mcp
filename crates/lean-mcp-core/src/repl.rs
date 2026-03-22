@@ -271,7 +271,13 @@ impl Repl {
     /// Extract the header (everything before the first declaration keyword) and
     /// body from the base code.
     pub fn split_header_body(base_code: &str) -> (String, String) {
-        // Declaration keywords that mark the end of the import block
+        // Declaration keywords that mark the start of the body.
+        //
+        // Context-establishing commands (`open`, `namespace`, `section`,
+        // `set_option`, `variable`) are deliberately **excluded** so they
+        // remain in the header. This ensures the REPL header environment
+        // includes the same namespace openings, options, and variables that
+        // `lake build` sees, preventing name-resolution divergence (#149).
         let decl_keywords = [
             "theorem ",
             "lemma ",
@@ -284,11 +290,6 @@ impl Repl {
             "noncomputable ",
             "private ",
             "protected ",
-            "open ",
-            "variable ",
-            "section ",
-            "namespace ",
-            "set_option ",
             "#check ",
             "#eval ",
         ];
@@ -682,10 +683,81 @@ mod tests {
 
     #[test]
     fn split_header_body_open_namespace() {
+        // `open Nat in` is a scoped modifier for the theorem — the split
+        // happens at `theorem` (after `open Nat in`), not at `open`.
+        // But since `open` is no longer a decl keyword, the first
+        // decl keyword is `theorem` on a later line. The `open Nat in`
+        // line is part of the header.
         let code = "import Lean\n\nopen Nat in\ntheorem foo := rfl";
         let (header, body) = Repl::split_header_body(code);
-        assert_eq!(header, "import Lean\n\n");
-        assert_eq!(body, "open Nat in\ntheorem foo := rfl");
+        assert_eq!(header, "import Lean\n\nopen Nat in\n");
+        assert_eq!(body, "theorem foo := rfl");
+    }
+
+    #[test]
+    fn split_header_body_open_in_header() {
+        // `open MeasureTheory` should be included in the header, not
+        // treated as a body separator. This ensures REPL name resolution
+        // matches lake build (#149).
+        let code =
+            "import Mathlib.MeasureTheory\n\nopen MeasureTheory\n\ntheorem foo : True := trivial";
+        let (header, body) = Repl::split_header_body(code);
+        assert_eq!(
+            header,
+            "import Mathlib.MeasureTheory\n\nopen MeasureTheory\n\n"
+        );
+        assert_eq!(body, "theorem foo : True := trivial");
+    }
+
+    #[test]
+    fn split_header_body_namespace_in_header() {
+        // `namespace` should be included in the header so the REPL
+        // elaborates in the correct namespace context.
+        let code = "import Lean\n\nnamespace MyModule\n\ndef foo := 42";
+        let (header, body) = Repl::split_header_body(code);
+        assert_eq!(header, "import Lean\n\nnamespace MyModule\n\n");
+        assert_eq!(body, "def foo := 42");
+    }
+
+    #[test]
+    fn split_header_body_set_option_in_header() {
+        // `set_option` should be included in the header so elaboration
+        // options match lake build context.
+        let code = "import Lean\n\nset_option autoImplicit false\n\ndef foo := 42";
+        let (header, body) = Repl::split_header_body(code);
+        assert_eq!(header, "import Lean\n\nset_option autoImplicit false\n\n");
+        assert_eq!(body, "def foo := 42");
+    }
+
+    #[test]
+    fn split_header_body_variable_in_header() {
+        // `variable` should be in the header so the REPL has the same
+        // section variables as lake build.
+        let code = "import Lean\n\nvariable (n : Nat)\n\ndef foo := n";
+        let (header, body) = Repl::split_header_body(code);
+        assert_eq!(header, "import Lean\n\nvariable (n : Nat)\n\n");
+        assert_eq!(body, "def foo := n");
+    }
+
+    #[test]
+    fn split_header_body_section_in_header() {
+        // `section` should be in the header for correct scoping context.
+        let code = "import Lean\n\nsection MySection\n\ndef foo := 42";
+        let (header, body) = Repl::split_header_body(code);
+        assert_eq!(header, "import Lean\n\nsection MySection\n\n");
+        assert_eq!(body, "def foo := 42");
+    }
+
+    #[test]
+    fn split_header_body_multiple_context_lines() {
+        // Multiple context-establishing lines should all be in header.
+        let code = "import Mathlib\n\nopen Nat\nnamespace Foo\nset_option autoImplicit false\nvariable (n : Nat)\n\ntheorem bar : n = n := rfl";
+        let (header, body) = Repl::split_header_body(code);
+        assert_eq!(
+            header,
+            "import Mathlib\n\nopen Nat\nnamespace Foo\nset_option autoImplicit false\nvariable (n : Nat)\n\n"
+        );
+        assert_eq!(body, "theorem bar : n = n := rfl");
     }
 
     // ---- SnippetResult construction ----------------------------------------
