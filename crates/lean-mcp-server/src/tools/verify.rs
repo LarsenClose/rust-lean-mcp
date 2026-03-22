@@ -120,10 +120,12 @@ pub fn scan_warnings(file_path: &Path) -> Vec<SourceWarning> {
 ///
 /// 1. Gets current file content from the LSP client.
 /// 2. Appends `#print axioms _root_.{theorem_name}` to the file.
-/// 3. Collects diagnostics from the appended region.
-/// 4. Parses axiom names from info-severity diagnostics.
-/// 5. Reverts file changes.
-/// 6. Optionally scans source for suspicious patterns.
+/// 3. Collects ALL diagnostics (not just the appended region).
+/// 4. Checks for compilation errors in the original file — if the file
+///    has errors, the verification result would be unreliable (#149).
+/// 5. Parses axiom names from the `#print axioms` info diagnostics.
+/// 6. Reverts file changes.
+/// 7. Optionally scans source for suspicious patterns.
 pub async fn handle_verify(
     client: &dyn LspClient,
     file_path: &str,
@@ -164,27 +166,62 @@ pub async fn handle_verify(
             message: e.to_string(),
         })?;
 
-    // 3. Get diagnostics from the appended region.
-    let appended_start = line_count as u32;
+    // 3. Get ALL diagnostics (entire file, not just the appended region).
+    //    We need the full set to (a) detect compilation errors in the
+    //    original file and (b) parse the #print axioms output.
     let raw = client
-        .get_diagnostics(file_path, Some(appended_start), None, Some(15.0))
+        .get_diagnostics(file_path, None, None, Some(15.0))
         .await
         .map_err(|e| LeanToolError::LspError {
             operation: "get_diagnostics".into(),
             message: e.to_string(),
         })?;
 
-    let diagnostics_arr = raw
+    let all_diagnostics = raw
         .get("diagnostics")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
 
-    // 4. Parse axioms and check for errors.
-    let axioms = parse_axioms(&diagnostics_arr);
-    let error_msg = check_axiom_errors(&diagnostics_arr);
+    // 4. Check for compilation errors in the original file region.
+    //    If the file itself has errors, the theorem may be invalid even
+    //    though `#print axioms` might succeed on a stale/partial result.
+    let appended_start = line_count as u32;
+    let file_errors: Vec<&str> = all_diagnostics
+        .iter()
+        .filter(|d| {
+            // Only look at errors (severity == 1) in the original file region.
+            let is_error = d.get("severity").and_then(Value::as_i64) == Some(1);
+            let diag_line = d
+                .get("range")
+                .or_else(|| d.get("fullRange"))
+                .and_then(|r| r.pointer("/start/line"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            is_error && diag_line < appended_start
+        })
+        .filter_map(|d| d.get("message").and_then(Value::as_str))
+        .collect();
 
-    // 5. Revert file changes.
+    // 5. Extract diagnostics from the #print axioms region for axiom parsing.
+    let axiom_diagnostics: Vec<Value> = all_diagnostics
+        .iter()
+        .filter(|d| {
+            let diag_line = d
+                .get("range")
+                .or_else(|| d.get("fullRange"))
+                .and_then(|r| r.pointer("/start/line"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            diag_line >= appended_start
+        })
+        .cloned()
+        .collect();
+
+    let axioms = parse_axioms(&axiom_diagnostics);
+    let axiom_error_msg = check_axiom_errors(&axiom_diagnostics);
+
+    // 6. Revert file changes.
     let revert_result = client
         .update_file_content(file_path, &original_content)
         .await;
@@ -193,12 +230,20 @@ pub async fn handle_verify(
         tracing::warn!("Failed to revert file after axiom check: {e}");
     }
 
-    // Check for axiom errors.
-    if let Some(err) = error_msg {
+    // Check for file compilation errors first (takes priority).
+    if !file_errors.is_empty() {
+        return Err(LeanToolError::AxiomCheckFailed(format!(
+            "File has compilation errors: {}",
+            file_errors.join("; ")
+        )));
+    }
+
+    // Check for axiom-region errors (e.g. unknown theorem name).
+    if let Some(err) = axiom_error_msg {
         return Err(LeanToolError::AxiomCheckFailed(err));
     }
 
-    // 6. Optionally scan source for suspicious patterns.
+    // 7. Optionally scan source for suspicious patterns.
     let warnings = if scan_source {
         let abs_path = project_path.join(file_path);
         scan_warnings(&abs_path)
@@ -576,12 +621,17 @@ mod tests {
     #[tokio::test]
     async fn handle_verify_returns_axioms() {
         let dir = TempDir::new().unwrap();
-        let client =
-            MockVerifyClient::new(dir.path().to_path_buf(), "theorem foo : True := trivial\n")
-                .with_diagnostics(vec![json!({
-                    "severity": 3,
-                    "message": "'foo' depends on axioms: [propext, Classical.choice, Quot.sound]"
-                })]);
+        // File has 1 line, so appended_start = 1. Axiom diagnostic at line 1
+        // (the #print axioms line) is in the axiom region.
+        let client = MockVerifyClient::new(
+            dir.path().to_path_buf(),
+            "theorem foo : True := trivial\n",
+        )
+        .with_diagnostics(vec![json!({
+            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 10}},
+            "severity": 3,
+            "message": "'foo' depends on axioms: [propext, Classical.choice, Quot.sound]"
+        })]);
 
         let result = handle_verify(&client, "Foo.lean", "foo", false)
             .await
@@ -595,10 +645,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_verify_with_errors_returns_axiom_check_failed() {
+    async fn handle_verify_with_axiom_region_errors_returns_axiom_check_failed() {
         let dir = TempDir::new().unwrap();
+        // Error at line 1 (the #print axioms line) — axiom region error.
         let client = MockVerifyClient::new(dir.path().to_path_buf(), "-- content\n")
             .with_diagnostics(vec![json!({
+                "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 10}},
                 "severity": 1,
                 "message": "unknown identifier 'nonexistent'"
             })]);
@@ -616,6 +668,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_verify_detects_file_compilation_errors() {
+        // If the file itself has compilation errors, verify should fail
+        // even if #print axioms would succeed (#149).
+        let dir = TempDir::new().unwrap();
+        let client = MockVerifyClient::new(
+            dir.path().to_path_buf(),
+            "theorem bad : False := sorry\n",
+        )
+        .with_diagnostics(vec![
+            // File error at line 0 (in the original file region).
+            json!({
+                "range": {"start": {"line": 0, "character": 23}, "end": {"line": 0, "character": 28}},
+                "severity": 1,
+                "message": "declaration uses 'sorry'"
+            }),
+            // Axiom info at line 1 (the #print axioms line).
+            json!({
+                "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 10}},
+                "severity": 3,
+                "message": "'bad' depends on axioms: [sorryAx]"
+            }),
+        ]);
+
+        let err = handle_verify(&client, "Bad.lean", "bad", false)
+            .await
+            .unwrap_err();
+
+        match err {
+            LeanToolError::AxiomCheckFailed(msg) => {
+                assert!(
+                    msg.contains("File has compilation errors"),
+                    "expected file compilation error, got: {msg}"
+                );
+                assert!(msg.contains("sorry"));
+            }
+            other => panic!("expected AxiomCheckFailed, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
     async fn handle_verify_with_source_scan() {
         let dir = TempDir::new().unwrap();
         // Create a file with a suspicious pattern.
@@ -626,11 +718,13 @@ mod tests {
         )
         .unwrap();
 
+        // File has 2 lines, so appended_start = 2. Axiom diagnostic at line 2.
         let client = MockVerifyClient::new(
             dir.path().to_path_buf(),
             "unsafe def x := 42\ntheorem bar : True := trivial\n",
         )
         .with_diagnostics(vec![json!({
+            "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 10}},
             "severity": 3,
             "message": "'bar' depends on axioms: [propext]"
         })]);
@@ -648,11 +742,13 @@ mod tests {
     #[tokio::test]
     async fn handle_verify_no_axioms() {
         let dir = TempDir::new().unwrap();
+        // File has 1 line, so appended_start = 1. Axiom diagnostic at line 1.
         let client = MockVerifyClient::new(
             dir.path().to_path_buf(),
             "theorem trivialThm : True := trivial\n",
         )
         .with_diagnostics(vec![json!({
+            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 10}},
             "severity": 3,
             "message": "'trivialThm' does not depend on any axioms"
         })]);
