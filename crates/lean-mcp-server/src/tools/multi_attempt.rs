@@ -28,11 +28,30 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 /// Convert raw LSP diagnostics into [`DiagnosticMessage`] items.
-pub fn to_diagnostic_messages(diagnostics: &[Value]) -> Vec<DiagnosticMessage> {
+///
+/// When `context_lines` is provided (> 0), diagnostics from lines before
+/// `context_lines` (0-indexed) are filtered out, and line numbers in the
+/// remaining diagnostics are adjusted so they are relative to the snippet.
+/// This mirrors the `to_diagnostic_messages` helper in `run_code.rs` and
+/// ensures that diagnostics from a context/base-code region are excluded.
+pub fn to_diagnostic_messages(
+    diagnostics: &[Value],
+    context_lines: usize,
+) -> Vec<DiagnosticMessage> {
     let mut items = Vec::new();
     for diag in diagnostics {
         let range = diag.get("fullRange").or_else(|| diag.get("range"));
         let Some(r) = range else { continue };
+
+        let raw_line = r
+            .pointer("/start/line")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+
+        // Filter out diagnostics from the context region.
+        if context_lines > 0 && (raw_line as usize) < context_lines {
+            continue;
+        }
 
         let severity_int = diag.get("severity").and_then(Value::as_i64).unwrap_or(1);
         let sev_name = match severity_int as i32 {
@@ -44,11 +63,8 @@ pub fn to_diagnostic_messages(diagnostics: &[Value]) -> Vec<DiagnosticMessage> {
         };
 
         let message = diag.get("message").and_then(Value::as_str).unwrap_or("");
-        let line = r
-            .pointer("/start/line")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            + 1;
+        // Adjust line number relative to snippet (subtract context lines).
+        let line = raw_line - context_lines as i64 + 1;
         let column = r
             .pointer("/start/character")
             .and_then(Value::as_i64)
@@ -399,7 +415,7 @@ async fn lsp_path(
                 .unwrap_or_default();
 
             let filtered = filter_diagnostics_by_line_range(&all_diags, line - 1, goal_line);
-            let diagnostics = to_diagnostic_messages(&filtered);
+            let diagnostics = to_diagnostic_messages(&filtered, 0);
 
             // Get goals
             let goal_result = client
@@ -502,7 +518,7 @@ pub async fn run_one_snippet_warm(
             .unwrap_or_default();
 
         let filtered = filter_diagnostics_by_line_range(&all_diags, line - 1, goal_line);
-        let diagnostics = to_diagnostic_messages(&filtered);
+        let diagnostics = to_diagnostic_messages(&filtered, 0);
 
         // Get goals
         let goal_result = client
@@ -672,20 +688,20 @@ pub async fn run_snippet_isolated(
             .cloned()
             .unwrap_or_default();
 
-        // Filter diagnostics to only those from the snippet region (after base_code).
-        // The snippet starts at base_line_count (0-indexed).
-        let snippet_start_line = base_line_count as u32;
-        let snippet_line_count = snippet_str.lines().count().max(1) as u32;
-        // Include the sorry line too (snippet_start_line + snippet_line_count)
-        let snippet_end_line = snippet_start_line + snippet_line_count;
-
-        let filtered =
-            filter_diagnostics_by_line_range(&all_diags, snippet_start_line, snippet_end_line);
-        let diagnostics = to_diagnostic_messages(&filtered);
+        // Filter diagnostics: use context_lines to exclude base_code diagnostics
+        // and adjust line numbers to be snippet-relative (matching run_code.rs's
+        // file_context approach). This prevents false positives from context-region
+        // diagnostics bleeding into snippet results — e.g., an error diagnostic
+        // from a tactic like `omega` on a `Field` goal may have a line number in
+        // the theorem header (context region) rather than the snippet region, so
+        // the old filter_diagnostics_by_line_range approach would miss it.
+        let context_lines = base_line_count;
+        let diagnostics = to_diagnostic_messages(&all_diags, context_lines);
 
         // Get goal state at the end of the snippet (before sorry)
-        // The snippet's last line is at snippet_start_line + snippet_line_count - 1
-        let goal_line = snippet_start_line + snippet_line_count - 1;
+        // The snippet's last line is at base_line_count + snippet_line_count - 1
+        let snippet_line_count = snippet_str.lines().count().max(1) as u32;
+        let goal_line = base_line_count as u32 + snippet_line_count - 1;
         let last_snippet_line = snippet_str.lines().last().unwrap_or("");
         let goal_column = indent.len() as u32 + last_snippet_line.len() as u32;
 
@@ -799,10 +815,12 @@ pub async fn handle_multi_attempt_parallel(
         });
     }
 
-    // 2. Extract code up to target line (imports + context before the tactic)
-    //    Inject maxHeartbeats to prevent runaway elaboration in isolated temp files.
-    let raw_base = lines[..line as usize - 1].join("\n");
-    let base_code = super::prepend_max_heartbeats(&raw_base);
+    // 2. Extract code up to target line (imports + context before the tactic).
+    //    Do NOT inject maxHeartbeats: the context file may have its own options,
+    //    and injecting an extra line shifts line numbers, confusing diagnostic
+    //    filtering (matching run_code.rs's file_context approach which also
+    //    skips maxHeartbeats when context is provided).
+    let base_code = lines[..line as usize - 1].join("\n");
 
     // 3. Extract target line's indentation so temp files preserve it
     let target_line = lines[(line - 1) as usize];
@@ -1570,11 +1588,52 @@ mod tests {
             "severity": 1,
             "message": "unknown id"
         })];
-        let items = to_diagnostic_messages(&diags);
+        let items = to_diagnostic_messages(&diags, 0);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].severity, "error");
         assert_eq!(items[0].line, 5);
         assert_eq!(items[0].column, 3);
+    }
+
+    #[test]
+    fn to_diagnostic_messages_filters_context_lines() {
+        // Simulate context file with 10 lines; diagnostics from context (line 3)
+        // and snippet (line 12) regions.
+        let diags = vec![
+            json!({
+                "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 5}},
+                "severity": 1,
+                "message": "context error"
+            }),
+            json!({
+                "range": {"start": {"line": 12, "character": 4}, "end": {"line": 12, "character": 10}},
+                "severity": 1,
+                "message": "snippet error"
+            }),
+        ];
+
+        let items = to_diagnostic_messages(&diags, 10);
+        // Only the snippet diagnostic should remain.
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].message, "snippet error");
+        // Line 12 (0-indexed) - 10 context lines + 1 (1-indexed) = 3
+        assert_eq!(items[0].line, 3);
+        assert_eq!(items[0].column, 5);
+    }
+
+    #[test]
+    fn to_diagnostic_messages_adjusts_line_numbers_with_context() {
+        // Context has 5 lines; diagnostic at 0-indexed line 5 => snippet line 1.
+        let diags = vec![json!({
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 5}},
+            "severity": 2,
+            "message": "warning in snippet"
+        })];
+
+        let items = to_diagnostic_messages(&diags, 5);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].line, 1);
+        assert_eq!(items[0].severity, "warning");
     }
 
     // ---- REPL path: falls back to LSP when column specified ----
@@ -1842,13 +1901,13 @@ mod tests {
     #[tokio::test]
     async fn parallel_single_snippet_returns_results() {
         let dir = tempfile::TempDir::new().unwrap();
-        // goal queried at (2, 6) -- line 2 (0-indexed, +1 for maxHeartbeats header),
-        // col = indent(2) + len("simp")(4) = 6
+        // goal queried at (1, 6) -- base has 1 line (0-indexed line 0),
+        // snippet at line 1, col = indent(2) + len("simp")(4) = 6
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result =
@@ -1868,13 +1927,13 @@ mod tests {
     async fn parallel_multiple_snippets() {
         let dir = tempfile::TempDir::new().unwrap();
         // goal columns: indent(2) + len("simp")(4) = 6, indent(2) + len("trivial")(7) = 9
-        // +1 line for maxHeartbeats header
+        // base has 1 line, so snippet at line 1 (0-indexed)
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})))
-        .with_goal(2, 9, Some(json!({"goals": []})));
+        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})))
+        .with_goal(1, 9, Some(json!({"goals": []})));
 
         let snippets = vec!["simp".to_string(), "trivial".to_string()];
         let result =
@@ -2042,15 +2101,15 @@ mod tests {
     #[tokio::test]
     async fn parallel_diagnostics_captured() {
         let dir = tempfile::TempDir::new().unwrap();
-        // Diagnostic line 2 (0-indexed): +1 for maxHeartbeats header
+        // Diagnostic at line 1 (0-indexed): base has 1 line, snippet at line 1
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
         .with_diagnostics(vec![json!({
             "range": {
-                "start": {"line": 2, "character": 0},
-                "end": {"line": 2, "character": 10}
+                "start": {"line": 1, "character": 0},
+                "end": {"line": 1, "character": 10}
             },
             "severity": 1,
             "message": "unknown tactic 'bad'"
@@ -2100,17 +2159,146 @@ mod tests {
         );
     }
 
+    // ---- Regression #148: context-region errors must not cause false positives ----
+
+    /// Regression test for #148: a tactic that produces an error diagnostic
+    /// with a line number in the context region (e.g., a unification error
+    /// referencing the theorem header) must NOT be treated as a success.
+    ///
+    /// The old code used `filter_diagnostics_by_line_range` which only kept
+    /// diagnostics physically within the snippet line range, discarding errors
+    /// whose line fell in the context. The fix uses `to_diagnostic_messages`
+    /// with `context_lines` which keeps all diagnostics from the snippet
+    /// region onward.
+    #[tokio::test]
+    async fn parallel_context_region_error_not_false_positive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Simulates a scenario like:
+        //   variable [Field K]
+        //   theorem foo (x : K) : x = x := by
+        //     sorry   <-- target line 3
+        //
+        // When "omega" is tried, the error diagnostic might have its line
+        // number at line 1 (the theorem header in the context region), not
+        // at the snippet line. The old filter would miss this error.
+        //
+        // File content: 2 lines of context + sorry at line 3.
+        // base_code = lines[0..2] = "variable [Field K]\ntheorem foo (x : K) : x = x := by"
+        // context_lines = 2
+        //
+        // Error diagnostic at line 1 (0-indexed, in context region) would be
+        // filtered by context_lines >= 2. But an error at the snippet line
+        // (line 2, 0-indexed) should be kept.
+        //
+        // The critical case: an error at the sorry/snippet boundary line
+        // that was previously missed by the tight line range filter.
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "variable [Field K]\ntheorem foo (x : K) : x = x := by\n  sorry",
+        )
+        .with_diagnostics(vec![
+            // Error in context region (should be filtered)
+            json!({
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 10}
+                },
+                "severity": 2,
+                "message": "unused variable warning"
+            }),
+            // Error at snippet line (should be kept) - the tactic itself fails
+            json!({
+                "range": {
+                    "start": {"line": 2, "character": 2},
+                    "end": {"line": 2, "character": 7}
+                },
+                "severity": 1,
+                "message": "omega failed to prove the goal"
+            }),
+            // Error after snippet (sorry line - should also be kept)
+            json!({
+                "range": {
+                    "start": {"line": 3, "character": 2},
+                    "end": {"line": 3, "character": 7}
+                },
+                "severity": 2,
+                "message": "declaration uses sorry"
+            }),
+        ]);
+
+        let snippets = vec!["omega".to_string()];
+        let result =
+            handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 3, &snippets, None)
+                .await
+                .unwrap();
+
+        // The snippet error MUST be captured - it should NOT be a false positive.
+        assert!(
+            result.items[0]
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == "error"),
+            "tactic error must be captured, not filtered as false positive; diagnostics: {:?}",
+            result.items[0].diagnostics
+        );
+        // The context-region warning should be filtered out.
+        assert!(
+            !result.items[0]
+                .diagnostics
+                .iter()
+                .any(|d| d.message == "unused variable warning"),
+            "context-region diagnostics should be filtered out"
+        );
+        // Snippet-region diagnostics should be present (both the error and the sorry warning).
+        assert_eq!(
+            result.items[0].diagnostics.len(),
+            2,
+            "should have snippet error + sorry warning"
+        );
+    }
+
+    /// Regression test for #148: verify that without maxHeartbeats injection,
+    /// line numbers in the temp file match the original file structure (no
+    /// +1 offset from a prepended set_option line).
+    #[tokio::test]
+    async fn parallel_no_heartbeats_line_offset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // File: line 0 = "import Mathlib", line 1 = "theorem ...", line 2 = "  sorry"
+        // Target line 3 (1-indexed). base_code = "import Mathlib\ntheorem ..." (2 lines).
+        // Without maxHeartbeats, snippet is at line 2 (0-indexed).
+        // With old maxHeartbeats, it would be at line 3 (0-indexed).
+        let client = MockParallelClient::new(
+            dir.path().to_path_buf(),
+            "import Mathlib\ntheorem foo : True := by\n  sorry",
+        )
+        // Goal at line 2 (base=2, snippet=1 line, goal_line = 2+1-1 = 2)
+        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
+
+        let snippets = vec!["simp".to_string()];
+        let result =
+            handle_multi_attempt_parallel(&client, dir.path(), "Main.lean", 3, &snippets, None)
+                .await
+                .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].goals,
+            vec!["|- True"],
+            "goal should be found at line 2 (no maxHeartbeats offset)"
+        );
+    }
+
     // ---- handle_multi_attempt dispatches to parallel when flag set ----
 
     #[tokio::test]
     async fn handle_multi_attempt_dispatches_parallel() {
         let dir = tempfile::TempDir::new().unwrap();
-        // goal column: indent(2) + len("simp")(4) = 6, +1 line for maxHeartbeats header
+        // goal column: indent(2) + len("simp")(4) = 6, base has 1 line so snippet at line 1
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result = handle_multi_attempt(
@@ -2190,13 +2378,13 @@ mod tests {
         // Prior tactic "intro h" at line 2.
         // The snippet "simp" should be written as "  simp" in the temp file,
         // so goal_column = indent(2) + len("simp")(4) = 6.
-        // +1 line for maxHeartbeats header -> goal line 3 (0-indexed).
+        // Base has 2 lines -> goal line 2 (0-indexed).
         let dir = tempfile::TempDir::new().unwrap();
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  intro h\n  sorry",
         )
-        .with_goal(3, 6, Some(json!({"goals": ["h : True\n|- True"]})));
+        .with_goal(2, 6, Some(json!({"goals": ["h : True\n|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result =
@@ -2218,11 +2406,11 @@ mod tests {
     async fn parallel_indentation_empty_base_code() {
         // Edge case: sorry is the FIRST line (line 1), so base_code is empty.
         // 4-space indent on the sorry line.
-        // +1 line for maxHeartbeats header -> snippet at line 1 (0-indexed).
+        // No base lines -> snippet at line 0 (0-indexed).
         let dir = tempfile::TempDir::new().unwrap();
         let client = MockParallelClient::new(dir.path().to_path_buf(), "    sorry")
             // goal_column = 4 (indent) + 4 ("simp") = 8
-            .with_goal(1, 8, Some(json!({"goals": ["|- Nat"]})));
+            .with_goal(0, 8, Some(json!({"goals": ["|- Nat"]})));
 
         let snippets = vec!["simp".to_string()];
         let result =
@@ -2247,16 +2435,14 @@ mod tests {
         // The goal is queried at the LAST line of the snippet.
         // Last snippet line = "exact h" (len 7), indent = 2
         // goal_column = 2 + 7 = 9
-        // +1 line for maxHeartbeats header
         let dir = tempfile::TempDir::new().unwrap();
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        // snippet_start_line = 2 (base has 1 line + 1 heartbeats header).
-        // Multi-line snippet has 2 lines, so last line is at 2 + 2 - 1 = line 3.
-        // goal_column = 2 + 7 = 9
-        .with_goal(3, 9, Some(json!({"goals": ["|- False"]})));
+        // base has 1 line, multi-line snippet has 2 lines.
+        // goal_line = 1 + 2 - 1 = 2, goal_column = 2 + 7 = 9
+        .with_goal(2, 9, Some(json!({"goals": ["|- False"]})));
 
         let snippets = vec!["simp\nexact h".to_string()];
         let result =
@@ -2702,8 +2888,7 @@ mod tests {
     async fn parallel_sorry_uses_target_indent() {
         // With 4-space indent, the sorry line should be "    sorry" not "  sorry".
         // We verify by checking diagnostics: the sorry line is at
-        // snippet_start_line + snippet_line_count (0-indexed).
-        // +1 for maxHeartbeats header line.
+        // base_line_count + snippet_line_count = 1 + 1 = line 2 (0-indexed).
         let dir = tempfile::TempDir::new().unwrap();
         let client = MockParallelClient::new(
             dir.path().to_path_buf(),
@@ -2711,14 +2896,14 @@ mod tests {
         )
         .with_diagnostics(vec![json!({
             "range": {
-                "start": {"line": 3, "character": 0},
-                "end": {"line": 3, "character": 9}
+                "start": {"line": 2, "character": 0},
+                "end": {"line": 2, "character": 9}
             },
             "severity": 2,
             "message": "declaration uses sorry"
         })])
-        // goal at (2, 8): indent(4) + len("simp")(4) = 8, +1 for heartbeats
-        .with_goal(2, 8, Some(json!({"goals": ["|- True"]})));
+        // goal at (1, 8): base has 1 line, indent(4) + len("simp")(4) = 8
+        .with_goal(1, 8, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result =
@@ -3033,12 +3218,12 @@ mod tests {
     #[tokio::test]
     async fn parallel_no_timeout_works_normally() {
         let dir = tempfile::TempDir::new().unwrap();
-        // +1 line for maxHeartbeats header
+        // base has 1 line, snippet at line 1 (0-indexed)
         let client = MockTimeoutClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result = handle_multi_attempt_parallel(
@@ -3069,12 +3254,12 @@ mod tests {
         // the mixed scenario by creating two separate calls and checking results.
         //
         // For the "fast" test, no delay:
-        // +1 line for maxHeartbeats header
+        // base has 1 line, snippet at line 1 (0-indexed)
         let fast_client = MockTimeoutClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
 
         let fast_snippets = vec!["simp".to_string()];
         let fast_result = handle_multi_attempt_parallel(
@@ -3127,12 +3312,12 @@ mod tests {
     #[tokio::test]
     async fn parallel_timed_out_not_in_normal_json() {
         let dir = tempfile::TempDir::new().unwrap();
-        // +1 line for maxHeartbeats header
+        // base has 1 line, snippet at line 1 (0-indexed)
         let client = MockTimeoutClient::new(
             dir.path().to_path_buf(),
             "theorem foo : True := by\n  sorry",
         )
-        .with_goal(2, 6, Some(json!({"goals": ["|- True"]})));
+        .with_goal(1, 6, Some(json!({"goals": ["|- True"]})));
 
         let snippets = vec!["simp".to_string()];
         let result = handle_multi_attempt_parallel(

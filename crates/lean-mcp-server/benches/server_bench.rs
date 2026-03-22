@@ -101,12 +101,12 @@ fn bench_to_diagnostic_messages(c: &mut Criterion) {
 
     group.bench_function("10_diags", |b| {
         let diags = make_diagnostics(10);
-        b.iter(|| to_diagnostic_messages(black_box(&diags)));
+        b.iter(|| to_diagnostic_messages(black_box(&diags), 0));
     });
 
     group.bench_function("100_diags", |b| {
         let diags = make_diagnostics(100);
-        b.iter(|| to_diagnostic_messages(black_box(&diags)));
+        b.iter(|| to_diagnostic_messages(black_box(&diags), 0));
     });
 
     group.finish();
